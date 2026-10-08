@@ -3,7 +3,9 @@
 flood       water rises `level` above stream level (HAND model). Tall buildings
             whose roofs stay well above water become vertical-evacuation refuges.
 landslide   susceptibility from slope, flow convergence and bare ground, plus a
-            downslope run-out zone. `level` = caution (0..1).
+            downslope run-out zone. `level` = caution (0..1). Slides start only on
+            natural slopes (hillside / mountain), never on roofs: buildings are
+            recognised and the slope is measured on the bare ground under them.
 earthquake  debris from a collapsing building can reach ~`level` x its height
             into the street. Open ground beyond that reach is an assembly area.
 
@@ -29,6 +31,15 @@ M2_PER_EVACUEE = 3.5             # Sphere minimum covered area per person
 MIN_SAFE_AREA_M2 = 300.0
 REFUGE_MIN_HEIGHT_M = 9.0        # ~3 storeys
 MAX_GRID = 320
+HILLSIDE_SLOPE_DEG = 15.0        # natural ground at least this steep counts as hillside / mountain
+LANDSLIDE_MIN_SLOPE_DEG = 12.0   # no slide source on gentler ground
+LANDSLIDE_MIN_SOURCE_M2 = 150.0  # slivers between houses are not slide sources
+BUILDING_BUFFER_M = 4.0          # a source must start at least this far from a building
+
+# land cover on the analysis grid (code, name, RGB)
+COVER = [(0, "flat open ground", (214, 200, 160)), (1, "hillside / mountain slope", (150, 100, 55)),
+         (2, "vegetated slope", (40, 110, 50)), (3, "vegetated flat ground", (110, 175, 90)),
+         (4, "building", (200, 60, 70)), (5, "water", (40, 90, 200))]
 
 HAZARDS = {
     "flood": {"label": "Flood", "param": "Water level rise", "default": 0.0, "min": 0.0, "max": 15.0},
@@ -58,6 +69,41 @@ class Terrain:
     flood_ref: np.ndarray        # height above the flood source (water body, else stream network)
     flood_seed: np.ndarray       # where the water starts
     water_bodies: list[dict]
+    cover: np.ndarray            # land-cover code per cell, see COVER
+    hillside: np.ndarray         # natural ground steep enough to slide
+
+
+def bare_earth(z: np.ndarray, under: np.ndarray, sigma: float = 2.0) -> np.ndarray:
+    """Ground surface with the cells in `under` (buildings) re-filled from the ground around them,
+    so building walls never look like steep slopes. Normalised convolution, widened until every
+    hole is filled (large blocks)."""
+    if not under.any():
+        return z
+    out = z.astype(np.float32).copy()
+    w = (~under).astype(np.float32)
+    zw = np.where(under, 0.0, z).astype(np.float32)
+    todo = under.copy()
+    s = sigma
+    while todo.any() and s < max(z.shape):
+        num, den = ndimage.gaussian_filter(zw, s), ndimage.gaussian_filter(w, s)
+        ok = todo & (den > 1e-3)
+        out[ok] = num[ok] / den[ok]
+        todo &= ~ok
+        s *= 2
+    if todo.any():                                  # the whole scene is buildings
+        out[todo] = float(np.median(z))
+    return out
+
+
+def _ground_scale(hm: HeightModel) -> float | None:
+    """Metres per model unit, from buildings whose height is known in metres."""
+    if hm.height_unit != "m" or not hm.building.any():
+        return None
+    b = hm.building & (hm.ndsm_rel > 1e-3)
+    if b.sum() < 20:
+        return None
+    k = float(np.median(hm.ndsm[b] / hm.ndsm_rel[b]))
+    return k if np.isfinite(k) and k > 0 else None
 
 
 def _down(a: np.ndarray, shape: tuple[int, int], interp=cv2.INTER_AREA) -> np.ndarray:
@@ -84,12 +130,22 @@ def build_terrain(hm: HeightModel, gsd: float | None, rgb: np.ndarray) -> Terrai
     exg = (2 * f[..., 1] - f[..., 0] - f[..., 2]) / (f.sum(axis=2) + 1)
     veg = _down((exg > 0.06).astype(np.float32), shape)
 
+    # slopes and drainage are measured on the bare ground: what is left of a building in the
+    # terrain (surface-DEM residue, AI depth) is filled from the ground around it
+    z = bare_earth(z, ndimage.binary_dilation(building))
     zs = ndimage.gaussian_filter(z, 1.0)
     gy, gx = np.gradient(zs, cell_m)
     grad = np.hypot(gx, gy)
     slope_is_metric = z_unit == "m" and gsd is not None
+    m_per_unit = _ground_scale(hm) if z_unit == "relative" and gsd else None
     if slope_is_metric:
         slope = np.degrees(np.arctan(grad))
+    elif m_per_unit is not None:
+        # no DEM, but building heights are in metres: the model's ground relief uses the same
+        # units, so a flat town reads as flat instead of being stretched into hills
+        g = bare_earth(_down(hm.rel - hm.ndsm_rel, shape) * m_per_unit, ndimage.binary_dilation(building))
+        gy, gx = np.gradient(ndimage.gaussian_filter(g, 1.0), cell_m)
+        slope = np.degrees(np.arctan(np.hypot(gx, gy)))
     else:   # relative terrain: map the 99th percentile gradient to 45 degrees
         slope = 45.0 * np.clip(grad / (np.percentile(grad, 99) + 1e-9), 0, 2)
 
@@ -124,11 +180,33 @@ def build_terrain(hm: HeightModel, gsd: float | None, rgb: np.ndarray) -> Terrai
     else:
         flood_seed = hydro.drainage
         flood_ref = hydro.hand
+
+    # what the ground is: buildings and water first, then natural slopes (hillside / mountain)
+    natural = ~building & ~water
+    hillside = natural & (slope >= HILLSIDE_SLOPE_DEG)
+    cover = np.zeros(shape, np.uint8)
+    cover[hillside] = 1
+    green = tree | (veg > 0.5)
+    cover[hillside & green] = 2
+    cover[natural & ~hillside & green] = 3
+    cover[building] = 4
+    cover[water] = 5
     return Terrain(factor=factor, shape=shape, cell_m=cell_m, metric_xy=gsd is not None, z=z,
                    z_unit=z_unit, ndsm=ndsm, height_unit=hm.height_unit, building=building, tree=tree,
                    water=water, veg=veg, slope_deg=slope, slope_is_metric=slope_is_metric,
                    population=population, hydro=hydro, flood_ref=flood_ref, flood_seed=flood_seed,
-                   water_bodies=water_bodies)
+                   water_bodies=water_bodies, cover=cover, hillside=hillside)
+
+
+def cover_shares(T: Terrain) -> dict:
+    return {name: round(float((T.cover == code).mean()), 3) for code, name, _ in COVER}
+
+
+def cover_rgb(T: Terrain) -> np.ndarray:
+    lut = np.zeros((256, 3), np.uint8)
+    for code, _, col in COVER:
+        lut[code] = col
+    return lut[T.cover]
 
 
 def _zone_name(i: int) -> str:
@@ -233,7 +311,15 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
         S = (0.6 * np.clip((T.slope_deg - 15) / 25, 0, 1) + 0.25 * acc_n * (T.slope_deg > 10)
              + 0.15 * (1 - T.veg))
         thr = 0.7 - 0.4 * np.clip(level, 0, 1)
-        source = S >= thr
+        # a slide starts on natural ground only (hillside / mountain), never on a roof or right
+        # next to a wall: the steepness there is the building, not the slope
+        buf = max(1, int(round(BUILDING_BUFFER_M / T.cell_m))) if T.metric_xy else 1
+        near_building = ndimage.binary_dilation(T.building, iterations=buf)
+        can_start = ~near_building & ~T.water & (T.slope_deg >= LANDSLIDE_MIN_SLOPE_DEG)
+        source = (S >= thr) & can_start
+        min_src = max(2, int(LANDSLIDE_MIN_SOURCE_M2 / cell_area)) if T.metric_xy else 4
+        slab, sids = _components(source, min_src, max_n=100000)
+        source = np.isin(slab, sids)
         runout = np.zeros(h * w, bool)
         front = np.flatnonzero(source.ravel())
         steps = int(100.0 / T.cell_m) if T.metric_xy else 20
@@ -244,8 +330,12 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
             if front.size == 0:
                 break
             runout[front] = True
-        runout = runout.reshape(h, w) & ~source
-        danger = source | runout
+        runout = runout.reshape(h, w) & ~source & ~T.water
+        # buildings are not landslides, but a building the debris reaches is at risk
+        blab, _ = _components(T.building, 1, max_n=100000)
+        hit_ids = np.unique(blab[runout & T.building])
+        bldg_in_path = np.isin(blab, hit_ids[hit_ids > 0])
+        danger = source | runout | bldg_in_path
         mult[danger] = 10.0
         mult[T.building & ~danger] = 4.0
         buffer_cells = max(1, int(30 / T.cell_m)) if T.metric_xy else 3
@@ -257,8 +347,18 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
             zone_kind[k + 1] = "Stable open ground"
             zone_capacity[k + 1] = (lab == i).sum() * cell_area / M2_PER_EVACUEE
         overlay[source] = [220, 40, 40, 170]
-        overlay[runout] = [245, 140, 30, 150]
+        overlay[runout & ~T.building] = [245, 140, 30, 150]
+        overlay[bldg_in_path] = [150, 60, 200, 200]
         hazard_name = f"landslide (caution {level:.1f})"
+        n_hit = int((hit_ids > 0).sum())
+        hill_share = float(T.hillside.mean())
+        landslide_note = (f"Recognised in the image: {int(blab.max())} "
+                          f"buildings, {hill_share:.0%} hillside / mountain slope, "
+                          f"{float(np.isin(T.cover, (0, 3)).mean()):.0%} flat ground. Landslides start only on natural "
+                          f"slopes, never on buildings; {n_hit} building{'s' if n_hit != 1 else ''} "
+                          f"lie in a debris run-out path (purple).")
+        if hill_share < 0.02:
+            landslide_note += " This area is almost flat, so landslide risk is low."
 
     else:  # earthquake
         heights = T.ndsm.copy()
@@ -348,6 +448,8 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
     }
 
     summary = _summary(hazard_name, stats, zones, bottlenecks, T.metric_xy)
+    if kind == "landslide":
+        summary.insert(0, landslide_note)
     if kind == "flood":
         if T.water_bodies:
             kinds = sorted({wb["kind"] for wb in T.water_bodies})
@@ -367,6 +469,7 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
     time_overlay = _time_overlay(tmin)
     payload = {"hazard": kind, "level": level, "hazard_name": hazard_name, "stats": stats,
                "water_bodies": T.water_bodies if kind == "flood" else [],
+               "land_cover": cover_shares(T),
                "summary": summary, "warnings": warnings, "zones": zones, "bottlenecks": bottlenecks,
                "arrows": arrow_list, "grid": [h, w], "units": {
                    "time": "minutes" if T.metric_xy else "approx. (pixel size unknown)",

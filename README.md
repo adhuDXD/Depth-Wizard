@@ -82,7 +82,7 @@ DEM ─► + datum offset ─► terrain (DTM)│◄── GCPs (fix DEM bias, a
 ### Escape routing (`depthwizard/hydrology.py`, `hazards.py`, `routing.py`)
 
 * **Flood.** Rivers, lakes and ponds are **detected in the image** (blue hue, flat, large). The water level starts at **0** (normal conditions) and the flood **spreads outward from those water bodies**: every cell's height above the water body it drains into is computed along D8 flow paths, and a rise of *h* floods the connected cells less than *h* above the water. With no water body in view, the terrain's drainage network (HAND) is the source. **Buildings whose roof stays ≥ 3 m above the water and that are ≥ 9 m tall become vertical-evacuation refuges.** This uses the estimated heights.
-* **Landslide.** Susceptibility from slope, flow convergence and bare ground, plus a downslope run-out along D8 paths.
+* **Landslide.** Every cell is first classified as **building, hillside / mountain slope (≥ 15°), vegetated slope, flat ground or water** (Expert → *Land cover*). Slopes are measured on the **bare ground**: building cells are refilled from the ground around them, so walls never look like cliffs. A slide can only **start on natural slopes**, never on a roof or within 4 m of a wall, and source patches under 150 m² are dropped. Susceptibility comes from slope, flow convergence and bare ground. Debris runs downslope along D8 paths for up to 100 m; buildings in that path are marked **at risk** (purple), not as landslides. Without a DEM, slopes are put in metres using the building height scale, so a flat town is not mistaken for hills.
 * **Earthquake.** Debris from a building can reach ~0.5 × its height. Streets inside that reach are penalised, and open ground beyond it becomes an assembly area. This also uses the estimated heights.
 * **Routing.** 8-connected grid. Cost = distance ÷ **Tobler hiking speed** (uphill/downhill aware) × hazard penalty. One Dijkstra run from a virtual "safety" node on the reversed graph gives every cell its time-to-safety and next step.
 * **People.** Population is estimated from building volume (floors × footprint ÷ 15 m²/person). Shelter capacity uses the Sphere 3.5 m²/person standard. Flow through the route tree gives the choke points.
@@ -113,7 +113,7 @@ LiDAR table remains its reference.
 
 * **Guided mode** (default), in three steps: load image → read the height-model card → pick a hazard and move the slider. Tap the map for the walking route from any spot. **Print evacuation plan** opens a one-page report.
 * **Expert mode** adds:
-  * layers: surface, building heights, confidence, **slope**, drainage, error, time-to-safety
+  * layers: surface, building heights, confidence, **land cover** (buildings vs hillside), **ground slope**, drainage, error, time-to-safety
   * 3D **fly mode** (F, WASD) and **DEM only** comparison (B)
   * **Previous results** list and `?job=` links
   * an elevation profile and a point inspector

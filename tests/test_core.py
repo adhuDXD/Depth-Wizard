@@ -107,3 +107,47 @@ def test_heuristic_model_runs():
     rgb = (np.random.default_rng(1).random((300, 400, 3)) * 255).astype(np.uint8)
     rel, unc = estimate_relative_height(rgb, HeuristicDepthModel())
     assert rel.shape == (300, 400) and 0 <= rel.min() and rel.max() <= 1
+
+
+def _town(dtm, n=300, ndsm_rel=None, unit="m"):
+    """A grid of 10 m tall houses on the given ground (None: no DEM)."""
+    from depthwizard.calibrate import HeightModel
+    b = np.zeros((n, n), bool)
+    for r in range(20, n - 20, 40):
+        for c in range(20, n - 20, 40):
+            b[r:r + 20, c:c + 20] = True
+    ndsm = np.where(b, 10.0, 0.0).astype(np.float32)
+    z = np.zeros((n, n), np.float32)
+    rel = (ndsm / 10.0 if ndsm_rel is None else ndsm_rel).astype(np.float32)
+    return HeightModel(rel=rel, unc_rel=z, terrain_rel=z, ndsm_rel=rel, ndsm=ndsm, dtm=dtm,
+                       dsm=(ndsm if dtm is None else dtm + ndsm), sigma=z, confidence=z.astype(np.uint8),
+                       building=b, tree=np.zeros_like(b), water=np.zeros_like(b), shadow=np.zeros_like(b),
+                       mode="absolute" if dtm is not None else "above_ground", height_unit=unit, info={})
+
+
+def test_landslides_never_start_on_buildings():
+    from depthwizard.hazards import build_terrain, run_scenario
+    n, gsd = 300, 1.0
+    yy = np.mgrid[0:n, 0:n][0].astype(np.float32)
+    dtm = yy * gsd * np.tan(np.radians(30))                # a 30 degree hillside
+    hm = _town(dtm)
+    rgb = np.full((n, n, 3), 140, np.uint8)
+    T = build_terrain(hm, gsd, rgb)
+    assert T.hillside.mean() > 0.4                         # the mountain is recognised
+    assert not (T.hillside & T.building).any()
+    res = run_scenario(T, "landslide", 1.0)
+    source = (res.overlay[..., 0] == 220) & (res.overlay[..., 1] == 40)
+    assert source.any() and not (source & T.building).any()
+
+
+def test_flat_town_without_dem_has_no_landslides():
+    from depthwizard.hazards import build_terrain, run_scenario
+    n, gsd = 300, 1.0
+    rng = np.random.default_rng(0)
+    hm = _town(None)
+    hm.rel = hm.rel + rng.normal(0, 0.002, hm.rel.shape).astype(np.float32)   # model noise on flat ground
+    T = build_terrain(hm, gsd, np.full((n, n, 3), 140, np.uint8))
+    assert T.hillside.mean() < 0.02
+    res = run_scenario(T, "landslide", 1.0)
+    assert res.payload["stats"]["danger_area_share"] < 0.02
+    assert "almost flat" in res.payload["summary"][0]

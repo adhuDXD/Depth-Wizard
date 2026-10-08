@@ -239,7 +239,7 @@ async function runScenario() {
     state.route = null; $('routeBox').classList.add('hidden');
     const ov = await loadImage(layerUrl(state.layer === 'time' ? 'time' : 'hazard'));
     if (seq !== scenarioSeq) return;
-    map.setOverlay(ov, state.layer === 'image' || state.layer === 'time' ? 0.85 : 0.6);
+    map.setOverlay(ov, overlayOpacity(state.layer));
     map.setVectors({ arrows: p.arrows, zones: p.zones, bottlenecks: p.bottlenecks, route: null });
     renderScenario(p);
     if (state.lastRoutePoint) await routeFrom(...state.lastRoutePoint);
@@ -276,7 +276,12 @@ function renderLegend() {
     html += '<b>Walking time to safety</b><div class="ramp" style="background:linear-gradient(90deg,#2f9d5e,#d9b21f,#e07b1a,#c93a3a)"></div><div class="ends"><span>0</span><span>10</span><span>30+ min</span></div>';
     html += sw('#5a0078', 'no safe path');
   } else if (state.layer === 'slope') {
-    html += '<b>Slope</b><div class="ramp" style="background:linear-gradient(90deg,#2b856e,#f2cc5e,#d94a38)"></div><div class="ends"><span>0°</span><span>30°</span><span>60°+</span></div>';
+    html += '<b>Ground slope</b><div class="ramp" style="background:linear-gradient(90deg,#2b856e,#f2cc5e,#d94a38)"></div><div class="ends"><span>0°</span><span>30°</span><span>60°+</span></div>';
+    html += sw('#6e6e6e', 'building (not a slope)');
+  } else if (state.layer === 'landcover') {
+    html += '<b>What the system recognised</b>';
+    html += sw('#c83c46', 'building') + sw('#96643a', 'hillside / mountain slope (≥15°)') + sw('#286e32', 'vegetated slope (forest / grass)');
+    html += sw('#6eaf5a', 'vegetated flat ground') + sw('#d6c8a0', 'flat open ground') + sw('#285ac8', 'water');
   } else if (state.layer === 'confidence') {
     html += sw('#28aa5a', 'high confidence') + sw('#f0b428', 'medium') + sw('#d72828', 'low (water, shadow, uncertain)');
   } else if (state.layer === 'buildings') {
@@ -286,7 +291,7 @@ function renderLegend() {
   } else {
     const hz = state.hazard;
     if (hz === 'flood') html += sw('#0f37a0', 'river / lake (detected)') + sw('#1e6ee6', 'flood water (darker = deeper)');
-    if (hz === 'landslide') html += sw('#dc2828', 'landslide source') + sw('#f58c1e', 'run-out path');
+    if (hz === 'landslide') html += sw('#dc2828', 'landslide source (natural slope)') + sw('#f58c1e', 'debris run-out path') + sw('#963cc8', 'building in run-out path');
     if (hz === 'earthquake') html += sw('#f58c1e', 'debris zone') + sw('#787878', 'buildings');
     html += sw('#28be5a', 'safe zone') + (hz === 'flood' ? sw('#14c8d2', 'refuge building (go up)') : '');
     html += '<div><i style="background:#c93a3a;border-radius:50%"></i>choke point</div>';
@@ -334,7 +339,7 @@ async function inspect(u, v) {
   const rows = [
     ['Surface height', `${fmt(p.surface, 2)}${state.job.mode === 'relative' ? '' : ' m'}`],
     ['Height above ground', `${fmt(p.height_above_ground, 1)}${unit} ± ${fmt(p.uncertainty, 1)}`],
-    ['Confidence', p.confidence], ['Slope', `${fmt(p.slope_deg)}°`],
+    ['Confidence', p.confidence], ['Slope', `${fmt(p.slope_deg)}°`], ['Land cover', p.land_cover],
     ['Above drainage', fmt(p.height_above_drainage, 1)],
   ];
   if (p.ground !== null) rows.splice(1, 0, ['Ground (DTM)', `${fmt(p.ground, 1)} m`]);
@@ -384,6 +389,12 @@ $('profileBtn').addEventListener('click', () => setTool(state.tool === 'profile'
 $('inspectBtn').addEventListener('click', () => setTool(state.tool === 'inspect' ? 'route' : 'inspect'));
 
 document.querySelectorAll('#layerSeg button').forEach((btn) => btn.addEventListener('click', () => setLayer(btn.dataset.layer)));
+// layers that are themselves a classification hide the hazard overlay
+function overlayOpacity(name) {
+  if (name === 'image' || name === 'time') return 0.85;
+  return ['confidence', 'error', 'landcover'].includes(name) ? 0 : 0.6;
+}
+
 async function setLayer(name) {
   if (!state.job) return;
   state.layer = name;
@@ -392,8 +403,7 @@ async function setLayer(name) {
   map.setBase(await loadImage(layerUrl(baseName)));
   if (state.scenario) {
     const ov = await loadImage(layerUrl(name === 'time' ? 'time' : 'hazard'));
-    const opacity = name === 'image' || name === 'time' ? 0.85 : (name === 'confidence' || name === 'error' ? 0 : 0.6);
-    map.setOverlay(ov, opacity);
+    map.setOverlay(ov, overlayOpacity(name));
   }
   renderLegend();
   refresh3dTexture();

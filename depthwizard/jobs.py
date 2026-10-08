@@ -21,7 +21,7 @@ from rasterio import features
 from . import render
 from .calibrate import CalibParams, HeightModel, calibrate
 from .depth import estimate_relative_height, load_default_model
-from .hazards import ScenarioResult, Terrain, build_terrain, route_from, run_scenario
+from .hazards import COVER, ScenarioResult, Terrain, build_terrain, cover_rgb, route_from, run_scenario
 from . import config
 from .dem import Dem, get_dem
 from .osm import get_buildings
@@ -292,11 +292,20 @@ def layer_png(job: Job, name: str) -> bytes:
         m = (hm.building | hm.tree)[..., None]
         img = np.where(m, col, gray)
     elif name == "slope":
-        gy, gx = np.gradient(cv2.GaussianBlur(hm.dsm.astype(np.float32), (0, 0), 1.0), cell)
-        slope = np.degrees(np.arctan(np.hypot(gx, gy)))
-        if hm.height_unit != "m":
-            slope = 60 * np.clip(np.hypot(gx, gy) / (np.percentile(np.hypot(gx, gy), 99) + 1e-9), 0, 1)
+        # slope of the bare ground (what landslides depend on); buildings greyed out
+        t = job.terrain
+        slope = cv2.resize(t.slope_deg.astype(np.float32), (s.rgb.shape[1], s.rgb.shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
         img = render.colormap(slope, render.SLOPE, 0, 60)
+        img[hm.building] = [110, 110, 110]
+    elif name == "landcover":
+        t = job.terrain
+        cov = cv2.resize(cover_rgb(t), (s.rgb.shape[1], s.rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        img = cov.copy()
+        img[hm.building] = dict((c, col) for c, _, col in COVER)[4]
+        img[hm.water] = dict((c, col) for c, _, col in COVER)[5]
+        gray = cv2.cvtColor(cv2.cvtColor(s.rgb, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+        img = (0.7 * img + 0.3 * gray).astype(np.uint8)
     elif name == "confidence":
         img = render.CONFIDENCE[hm.confidence]
     elif name == "drainage":
@@ -326,6 +335,7 @@ def point_info(job: Job, u: float, v: float) -> dict:
            "uncertainty": float(hm.sigma[r, c]), "confidence": ["low", "medium", "high"][int(hm.confidence[r, c])],
            "is_building": bool(hm.building[r, c]), "is_water": bool(hm.water[r, c]),
            "slope_deg": round(float(T.slope_deg[tr, tc]), 1),
+           "land_cover": "building" if hm.building[r, c] else COVER[int(T.cover[tr, tc])][1],
            "height_above_drainage": float(T.hydro.hand[tr, tc]), "unit": hm.height_unit}
     if job.scene.georeferenced:
         x, y = job.scene.transform @ (c + 0.5, r + 0.5)
