@@ -20,7 +20,7 @@ CRS = "EPSG:32645"                 # UTM 45N (Sikkim)
 ORIGIN = (634000.0, 3006500.0)     # near Namchi
 SUN_ELEVATION = 52.0
 SUN_AZIMUTH = 140.0
-DATUM_OFFSET = 46.0                # DEM is ellipsoidal: +46 m vs geoid
+GEOID_N = -43.8                    # EGM2008 geoid height at Namchi: CartoDEM (ellipsoidal) = H + N
 
 
 def _terrain(n: int, rng) -> np.ndarray:
@@ -120,10 +120,10 @@ def make_scene(seed: int = 7):
     img += rng.normal(0, 3, img.shape)
     rgb = np.clip(img, 0, 255).astype(np.uint8)
 
-    # ---- coarse ~30 m DEM (terrain only, ellipsoidal)
+    # ---- coarse ~30 m surface DEM, like CartoDEM: buildings and trees blurred in, ellipsoidal
     k = int(30 / GSD)
-    coarse = cv2.resize(terrain, (n // k + 1, n // k + 1), interpolation=cv2.INTER_AREA)
-    return {"rgb": rgb, "truth": dsm.astype(np.float32), "dem": coarse + DATUM_OFFSET,
+    coarse = cv2.resize(dsm, (n // k + 1, n // k + 1), interpolation=cv2.INTER_AREA)
+    return {"rgb": rgb, "truth": dsm.astype(np.float32), "dem": coarse + GEOID_N,
             "dem_gsd": GSD * n / coarse.shape[0], "terrain": terrain, "building_h": bldg_h, "tree_h": tree_h}
 
 
@@ -140,7 +140,8 @@ def write_scene(folder: Path) -> dict:
     with rasterio.open(paths["dem"], "w", driver="GTiff", width=dem.shape[1], height=dem.shape[0], count=1,
                        dtype="float32", crs=CRS, transform=from_origin(ORIGIN[0], ORIGIN[1], s["dem_gsd"], s["dem_gsd"])) as dst:
         dst.write(dem, 1)
+        dst.update_tags(DW_DEM_SOURCE="synthetic", DW_GEOID_N=GEOID_N)
     with rasterio.open(paths["truth"], "w", driver="GTiff", width=SIZE, height=SIZE, count=1, dtype="float32",
                        crs=CRS, transform=tr) as dst:
         dst.write(s["truth"], 1)
-    return {k: str(v) for k, v in paths.items()} | {"geoid_offset_m": -DATUM_OFFSET}
+    return {k: str(v) for k, v in paths.items()}

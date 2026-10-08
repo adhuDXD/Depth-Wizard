@@ -48,9 +48,10 @@ def test_demo_is_absolute_and_validated(demo_job):
 def test_ai_model_beats_dem_on_demo_town():
     jm = J.JobManager()
     d = J.DATA_DIR / "demo"
-    if not (d / "truth.tif").exists():
+    if not (d / ".v3").exists():
         write_scene(d)
-    job = jm.run_sync("demo", str(d / "image.tif"), str(d / "dem.tif"), str(d / "truth.tif"), {"geoid_offset_m": -46})
+        (d / ".v3").touch()
+    job = jm.run_sync("demo", str(d / "image.tif"), str(d / "dem.tif"), str(d / "truth.tif"), {"osm_fetch": False})
     v = job.validation
     assert v["depthwizard"]["all"]["rmse"] < v["dem_only"]["all"]["rmse"]
     assert v["depthwizard"]["buildings"]["rmse"] < 0.8 * v["dem_only"]["buildings"]["rmse"]

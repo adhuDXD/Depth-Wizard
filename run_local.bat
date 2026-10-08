@@ -31,6 +31,11 @@ if not exist "models\depth_anything_v2_vits.onnx" (
   if errorlevel 1 echo Model download failed: the app will run with the non-AI fallback.
 )
 
+if not exist "data\geoid\us_nga_egm08_25.tif" (
+  echo Downloading the EGM2008 geoid grid, about 81 MB, for CartoDEM datum conversion...
+  ".venv\Scripts\python.exe" scripts\fetch_geoid.py
+)
+
 echo.
 echo Starting DepthWizard at http://localhost:8000  -  keep this window open, close it to stop.
 start "" cmd /c "timeout /t 6 >nul & start http://localhost:8000"

@@ -32,7 +32,7 @@
           <strong id="dropText">Drop PNG / JPG / GeoTIFF here</strong>
           <span class="muted">or click to choose</span>
         </label>
-        <label class="field">Elevation model (DEM GeoTIFF, optional)
+        <label class="field">Elevation model (DEM GeoTIFF, optional: Copernicus 30 m is fetched automatically)
           <input type="file" id="demFile" accept=".tif,.tiff">
         </label>
         <details class="more">
@@ -43,14 +43,24 @@
             <label class="field">Sun elevation (°)<input type="number" id="sunEl" step="0.1" min="0" max="90" placeholder="from metadata"></label>
             <label class="field">Sun azimuth (°)<input type="number" id="sunAz" step="0.1" min="0" max="360" placeholder="from metadata"></label>
             <label class="field">Acquired (UTC)<input type="datetime-local" id="acquired"></label>
-            <label class="field">DEM datum offset (m)<input type="number" id="geoid" step="0.1" value="0"></label>
+            <label class="field">Off-nadir angle (°)<input type="number" id="offNadir" step="0.1" min="0" max="60" placeholder="from metadata"></label>
+            <label class="field">Satellite azimuth (°)<input type="number" id="viewAz" step="0.1" min="0" max="360" placeholder="ground → satellite"></label>
+            <label class="field">DEM datum offset (m)<input type="number" id="geoid" step="0.1" placeholder="auto"></label>
+            <label class="field">DEM type<select id="demKind"><option value="">auto (surface)</option><option value="surface">surface (DSM)</option><option value="terrain">bare earth (DTM)</option></select></label>
           </div>
-          <p class="hint">The sun angles and pixel size let DepthWizard measure building heights from shadows. GeoTIFFs usually carry them already.</p>
+          <label class="field">Ground control points (CSV: x,y,height_m · lon,lat,height_m)<input type="file" id="gcpFile" accept=".csv,.txt"></label>
+          <label class="field">Building footprints (OSM GeoJSON, optional)<input type="file" id="osmFile" accept=".geojson,.json"></label>
+          <label class="check"><input type="checkbox" id="osmFetch" checked> Look up OpenStreetMap buildings online (cached)</label>
+          <p class="hint">Sun angles + pixel size let DepthWizard measure building heights from shadows; the off-nadir angle corrects leaning buildings. GeoTIFFs usually carry these. CartoDEM is converted to sea-level heights automatically.</p>
         </details>
         <div class="row">
           <button class="primary" id="runBtn" disabled>Build 3D model</button>
           <button class="ghost" id="demoBtn">Try demo town</button>
+          <button class="ghost hidden" id="namchiBtn" title="Real Maxar WorldView-3 image of Namchi, Sikkim">Real: Namchi</button>
         </div>
+        <label class="field hidden" id="historyBox">Previous results
+          <select id="history"><option value="">Open a previous result…</option></select>
+        </label>
         <div class="progress hidden" id="progress"><div class="bar"><i id="progressBar"></i></div><span id="progressMsg"></span></div>
         <p class="error hidden" id="loadError"></p>
       </section>
@@ -98,6 +108,7 @@
             <button data-layer="height">Surface</button>
             <button data-layer="buildings">Heights</button>
             <button data-layer="confidence">Confidence</button>
+            <button data-layer="slope">Slope</button>
             <button data-layer="drainage">Drainage</button>
             <button data-layer="error" id="errorLayerBtn" class="hidden">Error</button>
             <button data-layer="time">Time to safety</button>
@@ -144,8 +155,12 @@
       </div>
       <div class="view hidden" id="view3d">
         <div id="three"></div>
-        <label class="exag">Height ×<input type="range" id="exag" min="1" max="6" step="0.5" value="1"><output id="exagOut">1</output></label>
-        <p class="hint3d">Drag to rotate · right-drag to pan · scroll to zoom</p>
+        <div class="tools3d">
+          <button class="ghost" id="flyBtn" title="First-person flight (F)">Fly (F)</button>
+          <button class="ghost" id="demOnlyBtn" title="Compare with the 30 m DEM alone (B)">DEM only (B)</button>
+          <label class="exag">Height ×<input type="range" id="exag" min="1" max="6" step="0.5" value="1"><output id="exagOut">1</output></label>
+        </div>
+        <p class="hint3d" id="hint3d">Drag to rotate · right-drag to pan · scroll to zoom</p>
       </div>
     </section>
   </main>
