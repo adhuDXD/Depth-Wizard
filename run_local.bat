@@ -14,6 +14,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
+fc /b requirements.txt ".venv\requirements.installed" >nul 2>nul
+if errorlevel 1 del ".venv\installed.ok" 2>nul
+
 if not exist ".venv\installed.ok" (
   echo [1/3] Creating the Python environment...
   if not exist ".venv\Scripts\python.exe" python -m venv .venv
@@ -23,6 +26,7 @@ if not exist ".venv\installed.ok" (
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt
   if errorlevel 1 goto fail
   echo ok> ".venv\installed.ok"
+  copy /y requirements.txt ".venv\requirements.installed" >nul
 )
 
 if not exist "models\depth_anything_v2_vits.onnx" (
