@@ -48,9 +48,10 @@ def test_demo_is_absolute_and_validated(demo_job):
 def test_ai_model_beats_dem_on_demo_town():
     jm = J.JobManager()
     d = J.DATA_DIR / "demo"
-    if not (d / "truth.tif").exists():
+    if not (d / ".v3").exists():
         write_scene(d)
-    job = jm.run_sync("demo", str(d / "image.tif"), str(d / "dem.tif"), str(d / "truth.tif"), {"geoid_offset_m": -46})
+        (d / ".v3").touch()
+    job = jm.run_sync("demo", str(d / "image.tif"), str(d / "dem.tif"), str(d / "truth.tif"), {"osm_fetch": False})
     v = job.validation
     assert v["depthwizard"]["all"]["rmse"] < v["dem_only"]["all"]["rmse"]
     assert v["depthwizard"]["buildings"]["rmse"] < 0.8 * v["dem_only"]["buildings"]["rmse"]
@@ -94,3 +95,14 @@ def test_rejects_bad_upload(client):
     assert r.status_code == 400
     r = client.post("/api/jobs", files={"image": ("a.png", b"abc", "image/png")}, data={"params": json.dumps({"gsd": -1})})
     assert r.status_code == 422
+
+
+def test_flood_starts_from_detected_water(client, demo_job):
+    jid = demo_job["id"]
+    shares = []
+    for level in (0, 3, 8):
+        p = client.post(f"/api/jobs/{jid}/scenario", json={"hazard": "flood", "level": level}).json()
+        assert p["water_bodies"], "the demo river should be detected"
+        shares.append(p["stats"]["danger_area_share"])
+    assert shares[0] < 0.05                  # level 0: only the river itself
+    assert shares[0] < shares[1] < shares[2]  # the flood grows outward with the level

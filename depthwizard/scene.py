@@ -19,7 +19,8 @@ from rasterio.transform import Affine
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from scipy import ndimage
 
-MAX_DIM = 1024
+from . import config
+
 GEOTIFF_SUFFIXES = {".tif", ".tiff", ".gtif", ".geotiff"}
 
 
@@ -32,6 +33,11 @@ class Scene:
     dem: np.ndarray | None = None        # (H, W) metres, on the image grid
     sun_elevation: float | None = None   # degrees, from metadata if present
     sun_azimuth: float | None = None     # degrees clockwise from north
+    valid: np.ndarray | None = None      # False outside the image footprint / nodata
+    off_nadir: float | None = None       # degrees, from metadata
+    view_azimuth: float | None = None    # degrees, ground -> satellite
+    acquired: str | None = None          # ISO time from metadata, if any
+    notes: list | None = None
 
     @property
     def georeferenced(self) -> bool:
@@ -78,6 +84,18 @@ def _fill_nan(a: np.ndarray) -> np.ndarray:
     return a[tuple(idx)]
 
 
+def _read_view_tags(src) -> tuple[float | None, float | None]:
+    tags = {k.upper(): v for k, v in src.tags().items()}
+    out = []
+    for names in (("OFF_NADIR", "OFFNADIR", "VIEW_OFF_NADIR"), ("VIEW_AZIMUTH", "SAT_AZIMUTH", "SATELLITE_AZIMUTH")):
+        val = next((tags[n] for n in names if n in tags), None)
+        try:
+            out.append(float(val) if val is not None else None)
+        except ValueError:
+            out.append(None)
+    return out[0], out[1]
+
+
 def _read_sun_tags(src) -> tuple[float | None, float | None]:
     tags = {k.upper(): v for k, v in src.tags().items()}
     def pick(*names):
@@ -93,7 +111,8 @@ def _read_sun_tags(src) -> tuple[float | None, float | None]:
     return el, az
 
 
-def load_image(path: str | Path, gsd_hint: float | None = None, max_dim: int = MAX_DIM) -> Scene:
+def load_image(path: str | Path, gsd_hint: float | None = None, max_dim: int | None = None) -> Scene:
+    max_dim = max_dim or config.get("input.max_long_side")
     path = Path(path)
     if path.suffix.lower() in GEOTIFF_SUFFIXES:
         with warnings.catch_warnings():
@@ -148,10 +167,12 @@ def _load_georeferenced(src, max_dim: int) -> Scene:
             source=rasterio.band(src, b), destination=dst,
             src_transform=src.transform, src_crs=src.crs, src_nodata=src.nodata,
             dst_transform=transform, dst_crs=dst_crs, dst_nodata=np.nan,
-            resampling=Resampling.bilinear,
+            resampling=Resampling.average if scale > 1 else Resampling.bilinear,
         )
         bands.append(dst)
     valid = np.all([np.isfinite(b) for b in bands], axis=0)
+    if src.nodata is None and src.dtypes[0] == "uint8":        # mosaics often use 0 as nodata
+        valid &= np.any([np.nan_to_num(b) > 0 for b in bands], axis=0)
     src_is_byte = src.dtypes[0] == "uint8"
     rgb_bands = []
     for b in bands:
@@ -160,14 +181,20 @@ def _load_georeferenced(src, max_dim: int) -> Scene:
     if nb == 1:
         rgb_bands = rgb_bands * 3
     el, az = _read_sun_tags(src)
+    notes = []
+    if scale > 1:
+        notes.append(f"Image downsampled {scale:.1f}x to {w}x{h} px (input.max_long_side = {max_dim}).")
+    acquired = {k.upper(): v for k, v in src.tags().items()}.get("ACQUIRED")
     return Scene(
         rgb=np.stack(rgb_bands, -1), gsd=abs(transform.a), transform=transform,
         crs=dst_crs.to_string(), sun_elevation=el, sun_azimuth=az,
+        valid=None if valid.all() else valid, acquired=acquired, notes=notes,
+        off_nadir=_read_view_tags(src)[0], view_azimuth=_read_view_tags(src)[1],
     )
 
 
 def load_dem(path: str | Path, scene: Scene) -> np.ndarray:
-    """Resample a DEM GeoTIFF onto the scene grid (metres)."""
+    """Resample a height GeoTIFF (e.g. a reference DSM) onto the scene grid (metres)."""
     if not scene.georeferenced:
         raise ValueError("A DEM can only be aligned with a georeferenced (GeoTIFF) image.")
     h, w = scene.shape

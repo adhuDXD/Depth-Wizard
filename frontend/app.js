@@ -28,13 +28,36 @@ async function init() {
     const h = await (await api('/api/health')).json();
     state.hazards = h.hazards;
     const b = $('modelBadge');
-    b.textContent = h.model_is_ai ? `AI: ${h.model}` : 'No AI model installed: demo heuristic';
+    b.textContent = `v${h.version} · ` + (h.model_is_ai ? `AI: ${h.model}` : 'No AI model installed: demo heuristic');
     b.classList.toggle('fallback', !h.model_is_ai);
     configureSlider();
+    const d = await (await api('/api/demos')).json();
+    $('namchiBtn').classList.toggle('hidden', !d.namchi);
+    await refreshHistory();
+    const want = new URLSearchParams(location.search).get('job');
+    if (want) openJob(want);
   } catch (e) {
     $('modelBadge').textContent = 'Server offline';
   }
 }
+
+// ------------------------------------------------------------------ previous results (?job=<id>)
+async function refreshHistory() {
+  const list = (await (await api('/api/jobs')).json()).filter((j) => j.status === 'done');
+  $('historyBox').classList.toggle('hidden', !list.length);
+  $('history').innerHTML = '<option value="">Open a previous result…</option>' + list.map((j) =>
+    `<option value="${j.id}">${escapeHtml(j.name)} · ${j.created.replace('T', ' ').slice(0, 16)}</option>`).join('');
+}
+async function openJob(id) {
+  try {
+    const meta = await (await api(`/api/jobs/${id}`)).json();
+    if (meta.status === 'done') await onReady(meta);
+  } catch (e) {
+    $('loadError').textContent = `Could not open that result: ${e.message}`;
+    $('loadError').classList.remove('hidden');
+  }
+}
+$('history').addEventListener('change', () => { if ($('history').value) openJob($('history').value); });
 
 document.querySelectorAll('[data-set-mode]').forEach((btn) => btn.addEventListener('click', () => {
   document.body.dataset.mode = btn.dataset.setMode;
@@ -61,15 +84,19 @@ $('runBtn').addEventListener('click', async () => {
   const fd = new FormData();
   fd.append('image', imageFile.files[0]);
   if ($('demFile').files.length) fd.append('dem', $('demFile').files[0]);
+  if ($('gcpFile').files.length) fd.append('gcps', $('gcpFile').files[0]);
+  if ($('osmFile').files.length) fd.append('osm', $('osmFile').files[0]);
   const acquired = $('acquired').value;
   fd.append('params', JSON.stringify({
     gsd: numberOrNull('gsd'), sun_elevation: numberOrNull('sunEl'), sun_azimuth: numberOrNull('sunAz'),
-    acquired: acquired ? `${acquired}:00Z` : null, geoid_offset_m: numberOrNull('geoid') ?? 0,
-    building_height_prior_m: numberOrNull('prior'),
+    acquired: acquired ? `${acquired}:00Z` : null, geoid_offset_m: numberOrNull('geoid'),
+    building_height_prior_m: numberOrNull('prior'), off_nadir: numberOrNull('offNadir'),
+    view_azimuth: numberOrNull('viewAz'), dem_kind: $('demKind').value || null, osm_fetch: $('osmFetch').checked,
   }));
   startJob(() => api('/api/jobs', { method: 'POST', body: fd }));
 });
 $('demoBtn').addEventListener('click', () => startJob(() => api('/api/demo', { method: 'POST' })));
+$('namchiBtn').addEventListener('click', () => startJob(() => api('/api/demo?scene=namchi', { method: 'POST' })));
 
 async function startJob(request) {
   $('loadError').classList.add('hidden');
@@ -87,6 +114,7 @@ async function startJob(request) {
     $('progressBar').style.width = '100%';
     $('progressMsg').textContent = 'Done';
     await onReady(meta);
+    refreshHistory();
   } catch (e) {
     $('loadError').textContent = `Could not process: ${e.message}`;
     $('loadError').classList.remove('hidden');
@@ -98,6 +126,9 @@ async function startJob(request) {
 // ------------------------------------------------------------------ step 2: model
 async function onReady(meta) {
   state.job = meta; state.scenario = null; state.route = null; state.profilePts = []; state.lastRoutePoint = null;
+  state.demOnly = false; $('demOnlyBtn').classList.remove('on');
+  $('demOnlyBtn').classList.toggle('hidden', !meta.dem);
+  history.replaceState(null, '', `?job=${meta.id}`);
   $('empty').classList.add('hidden');
   ['stepModel', 'stepHazard', 'stepExpert'].forEach((id) => $(id).classList.remove('hidden'));
   renderModelCard(meta);
@@ -134,6 +165,8 @@ function renderModelCard(m) {
   if (m.building_height_p95 && m.height_unit === 'm') tiles.push([`${fmt(m.building_height_p95, 0)} m`, 'tall buildings (95th pct)']);
   if (m.gsd) tiles.push([`${fmt(m.gsd, 2)} m`, 'pixel size']);
   if (m.sun && m.sun.elevation !== null) tiles.push([`${fmt(m.sun.elevation, 0)}° / ${fmt(m.sun.azimuth, 0)}°`, `sun (${m.sun.source})`]);
+  if (m.dem) tiles.unshift([m.dem.source.replace('copernicus_glo30', 'Copernicus 30 m').replace('cartodem', 'CartoDEM'), `DEM · ${m.dem.datum.split(' (')[0]}`]);
+  if (m.view && m.view.off_nadir) tiles.push([`${fmt(m.view.off_nadir, 0)}°`, 'off-nadir (lean corrected)']);
   $('modelTiles').innerHTML = tiles.slice(0, 6).map(([b, s]) => `<div class="tile"><b>${b}</b><span>${s}</span></div>`).join('');
   const cs = c.confidence_share;
   $('confBar').innerHTML = `<i style="flex:${cs.green}"></i><i style="flex:${cs.amber}"></i><i style="flex:${cs.red}"></i>`;
@@ -206,7 +239,7 @@ async function runScenario() {
     state.route = null; $('routeBox').classList.add('hidden');
     const ov = await loadImage(layerUrl(state.layer === 'time' ? 'time' : 'hazard'));
     if (seq !== scenarioSeq) return;
-    map.setOverlay(ov, state.layer === 'image' || state.layer === 'time' ? 0.85 : 0.6);
+    map.setOverlay(ov, overlayOpacity(state.layer));
     map.setVectors({ arrows: p.arrows, zones: p.zones, bottlenecks: p.bottlenecks, route: null });
     renderScenario(p);
     if (state.lastRoutePoint) await routeFrom(...state.lastRoutePoint);
@@ -242,6 +275,13 @@ function renderLegend() {
   if (state.layer === 'time') {
     html += '<b>Walking time to safety</b><div class="ramp" style="background:linear-gradient(90deg,#2f9d5e,#d9b21f,#e07b1a,#c93a3a)"></div><div class="ends"><span>0</span><span>10</span><span>30+ min</span></div>';
     html += sw('#5a0078', 'no safe path');
+  } else if (state.layer === 'slope') {
+    html += '<b>Ground slope</b><div class="ramp" style="background:linear-gradient(90deg,#2b856e,#f2cc5e,#d94a38)"></div><div class="ends"><span>0°</span><span>30°</span><span>60°+</span></div>';
+    html += sw('#6e6e6e', 'building (not a slope)');
+  } else if (state.layer === 'landcover') {
+    html += '<b>What the system recognised</b>';
+    html += sw('#c83c46', 'building') + sw('#96643a', 'hillside / mountain slope (≥15°)') + sw('#286e32', 'vegetated slope (forest / grass)');
+    html += sw('#6eaf5a', 'vegetated flat ground') + sw('#d6c8a0', 'flat open ground') + sw('#285ac8', 'water');
   } else if (state.layer === 'confidence') {
     html += sw('#28aa5a', 'high confidence') + sw('#f0b428', 'medium') + sw('#d72828', 'low (water, shadow, uncertain)');
   } else if (state.layer === 'buildings') {
@@ -250,8 +290,8 @@ function renderLegend() {
     html += '<b>DSM − reference</b><div class="ramp" style="background:linear-gradient(90deg,#2878dc,#f5f5f5,#d72828)"></div><div class="ends"><span>−6 m</span><span>0</span><span>+6 m</span></div>';
   } else {
     const hz = state.hazard;
-    if (hz === 'flood') html += sw('#1e6ee6', 'flooded (darker = deeper)');
-    if (hz === 'landslide') html += sw('#dc2828', 'landslide source') + sw('#f58c1e', 'run-out path');
+    if (hz === 'flood') html += sw('#0f37a0', 'river / lake (detected)') + sw('#1e6ee6', 'flood water (darker = deeper)');
+    if (hz === 'landslide') html += sw('#dc2828', 'landslide source (natural slope)') + sw('#f58c1e', 'debris run-out path') + sw('#963cc8', 'building in run-out path');
     if (hz === 'earthquake') html += sw('#f58c1e', 'debris zone') + sw('#787878', 'buildings');
     html += sw('#28be5a', 'safe zone') + (hz === 'flood' ? sw('#14c8d2', 'refuge building (go up)') : '');
     html += '<div><i style="background:#c93a3a;border-radius:50%"></i>choke point</div>';
@@ -299,7 +339,7 @@ async function inspect(u, v) {
   const rows = [
     ['Surface height', `${fmt(p.surface, 2)}${state.job.mode === 'relative' ? '' : ' m'}`],
     ['Height above ground', `${fmt(p.height_above_ground, 1)}${unit} ± ${fmt(p.uncertainty, 1)}`],
-    ['Confidence', p.confidence], ['Slope', `${fmt(p.slope_deg)}°`],
+    ['Confidence', p.confidence], ['Slope', `${fmt(p.slope_deg)}°`], ['Land cover', p.land_cover],
     ['Above drainage', fmt(p.height_above_drainage, 1)],
   ];
   if (p.ground !== null) rows.splice(1, 0, ['Ground (DTM)', `${fmt(p.ground, 1)} m`]);
@@ -349,6 +389,12 @@ $('profileBtn').addEventListener('click', () => setTool(state.tool === 'profile'
 $('inspectBtn').addEventListener('click', () => setTool(state.tool === 'inspect' ? 'route' : 'inspect'));
 
 document.querySelectorAll('#layerSeg button').forEach((btn) => btn.addEventListener('click', () => setLayer(btn.dataset.layer)));
+// layers that are themselves a classification hide the hazard overlay
+function overlayOpacity(name) {
+  if (name === 'image' || name === 'time') return 0.85;
+  return ['confidence', 'error', 'landcover'].includes(name) ? 0 : 0.6;
+}
+
 async function setLayer(name) {
   if (!state.job) return;
   state.layer = name;
@@ -357,8 +403,7 @@ async function setLayer(name) {
   map.setBase(await loadImage(layerUrl(baseName)));
   if (state.scenario) {
     const ov = await loadImage(layerUrl(name === 'time' ? 'time' : 'hazard'));
-    const opacity = name === 'image' || name === 'time' ? 0.85 : (name === 'confidence' || name === 'error' ? 0 : 0.6);
-    map.setOverlay(ov, opacity);
+    map.setOverlay(ov, overlayOpacity(name));
   }
   renderLegend();
   refresh3dTexture();
@@ -424,6 +469,12 @@ async function show3d() {
     const ex = j.extent_m || [j.width, j.height];
     viewer.setTerrain(heights, gw, gh, ex[0], ex[1], j.mode !== 'relative');
     viewer.setExaggeration(Number($('exag').value));
+    viewer.onFlyChange = (on) => {
+      $('flyBtn').classList.toggle('on', on);
+      $('hint3d').textContent = on ? 'Flying: W A S D / arrows to move · mouse to look · E up · Q down · Shift faster · Esc to stop'
+        : 'Drag to rotate · right-drag to pan · scroll to zoom';
+    };
+    state.dsmHeights = heights; state.demHeights = null;
     state.three = j.id;
   }
   viewer.visible = true;
@@ -433,6 +484,25 @@ async function show3d() {
 function refresh3dTexture() {
   if (viewer && state.three && state.view === '3d') viewer.setTexture(map.composite());
 }
+async function toggleDemOnly() {
+  if (!viewer || !state.job || !state.job.dem) return;
+  if (!state.demHeights) {
+    const res = await api(`/api/jobs/${state.job.id}/heightmap?which=dem`);
+    state.demHeights = new Float32Array(await res.arrayBuffer());
+  }
+  state.demOnly = !state.demOnly;
+  viewer.setHeights(state.demOnly ? state.demHeights : state.dsmHeights);
+  $('demOnlyBtn').classList.toggle('on', state.demOnly);
+  $('demOnlyBtn').textContent = state.demOnly ? 'DEM only: ON (B)' : 'DEM only (B)';
+}
+$('demOnlyBtn').addEventListener('click', toggleDemOnly);
+$('flyBtn').addEventListener('click', () => viewer && (viewer.fly.isLocked ? viewer.stopFly() : viewer.startFly()));
+window.addEventListener('keydown', (e) => {
+  if (state.view !== '3d' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.code === 'KeyB') toggleDemOnly();
+  if (e.code === 'KeyF' && viewer && !viewer.fly.isLocked) viewer.startFly();
+});
+
 $('exag').addEventListener('input', () => {
   $('exagOut').textContent = $('exag').value;
   if (viewer) viewer.setExaggeration(Number($('exag').value));

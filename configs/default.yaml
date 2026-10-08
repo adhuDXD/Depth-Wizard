@@ -1,0 +1,35 @@
+# Every tunable lives here (ported from the original DepthWizard repo, configs/default.yaml).
+# Override any value by editing this file or pointing DEPTHWIZARD_CONFIG at another YAML.
+
+input:
+  max_long_side: 2048        # larger inputs are downsampled (warning in the notes)
+  stretch_percentiles: [2, 98]
+
+depth:
+  tile_size: 518             # native-resolution tiles, multiple of the 14 px ViT patch
+  tile_overlap: 0.5          # 50% overlap: Hann windows of neighbours sum to 1
+  align_trim_frac: 0.05      # drop the largest residuals when aligning a tile to the global pass
+  tta: true                  # flips/rotation for the uncertainty map
+
+dem:
+  # Copernicus GLO-30 (EGM2008) is fetched automatically for GeoTIFFs without a DEM, then cached.
+  auto_fetch: true
+  copernicus_url: https://copernicus-dem-30m.s3.amazonaws.com/{name}/{name}.tif
+  fetch_timeout_s: 60
+  cache_dir: data/cache/copernicus
+  # EGM2008 geoid grid (scripts/fetch_geoid.py): converts ellipsoidal DEMs such as CartoDEM V3R1
+  # to sea-level heights. Without it, the offset is measured against Copernicus when possible.
+  geoid_grid: data/geoid/us_nga_egm08_25.tif
+  datum_check_min_offset_m: 10.0   # a median difference larger than this is treated as a datum offset
+
+calibration:
+  # Surface DEMs (Copernicus, SRTM, CartoDEM) already contain blurred buildings. The model detail
+  # is high-passed at the DEM's own blur, sigma = k * dem_res / pixel_size, so it is not counted twice.
+  band_sigma_k: 1.0
+  # DEM-band scale (used when no shadows or GCPs): regress the DEM's own resolvable detail on the
+  # model's in the same band, and only trust it if they correlate.
+  band_coarse_cells: 4.0
+  band_min_r: 0.1
+  band_min_cells: 64
+  ground_window_m: 60.0
+  max_building_height_m: 120.0   # shadow measurements above this are rejected as misreads

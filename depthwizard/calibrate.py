@@ -20,6 +20,9 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
+from . import config
+from .dem import Dem
+
 DEM_SIGMA_M = 5.0          # typical vertical error of 30 m national DEMs
 MIN_SUN_ELEVATION = 10.0
 
@@ -32,6 +35,9 @@ class CalibParams:
     gcps: list[dict] = field(default_factory=list)   # {"u","v" in [0,1], "elevation" m}
     geoid_offset_m: float = 0.0
     building_height_prior_m: float | None = None     # "tallest buildings are about X m"
+    off_nadir: float | None = None                   # degrees from vertical
+    view_azimuth: float | None = None                # degrees, from the ground towards the satellite
+    footprints: tuple | None = None                  # (label image, tagged heights, source) from osm.py
     ground_window_m: float = 60.0
 
 
@@ -76,22 +82,58 @@ def detect_shadows(rgb: np.ndarray, water: np.ndarray | None = None) -> np.ndarr
     return _remove_small(m, 4)
 
 
+def _local_std(gray: np.ndarray, size: int = 5) -> np.ndarray:
+    return np.sqrt(np.maximum(ndimage.uniform_filter(gray ** 2, size) - ndimage.uniform_filter(gray, size) ** 2, 0))
+
+
 def detect_vegetation(rgb: np.ndarray) -> np.ndarray:
+    """Green AND textured: tree canopy is leafy, a green-painted roof is smooth."""
     f = rgb.astype(np.float32)
     exg = (2 * f[..., 1] - f[..., 0] - f[..., 2]) / (f.sum(axis=2) + 1)
-    return exg > 0.06
+    return (exg > 0.06) & (_local_std(f.mean(axis=2)) > 5)
 
 
-def detect_water(rgb: np.ndarray, gsd: float | None) -> np.ndarray:
-    f = rgb.astype(np.float32)
-    r, g, b = f[..., 0], f[..., 1], f[..., 2]
-    gray = f.mean(axis=2)
-    local_std = np.sqrt(np.maximum(
-        ndimage.uniform_filter(gray ** 2, 7) - ndimage.uniform_filter(gray, 7) ** 2, 0))
-    m = (b > g * 1.03) & (b > r * 1.12) & (local_std < 10)
-    min_px = int(2000 / gsd ** 2) if gsd else 400
-    m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
-    return _remove_small(m, max(min_px, 50))
+def roof_segments(rgb: np.ndarray, ndsm_rel: np.ndarray, thr: float, shadow: np.ndarray,
+                  gsd: float | None) -> np.ndarray:
+    """Whole roofs: uniform-colour patches bounded by edges whose median relative
+    height is raised. Snapping to these patches recovers roof parts the depth
+    model under-estimates, and gives buildings clean, straight outlines."""
+    lab_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    grad = sum(np.hypot(cv2.Sobel(lab_img[..., c], cv2.CV_32F, 1, 0), cv2.Sobel(lab_img[..., c], cv2.CV_32F, 0, 1))
+               for c in range(3))
+    uniform = (grad < 60) & (_local_std(rgb.astype(np.float32).mean(axis=2)) < 6) & ~shadow
+    uniform = cv2.morphologyEx(uniform.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(uniform, connectivity=4)
+    if n <= 1:
+        return np.zeros(rgb.shape[:2], bool)
+    area = stats[:, cv2.CC_STAT_AREA]
+    px_m2 = gsd ** 2 if gsd else 0.25
+    med = ndimage.median(ndsm_rel, lab, np.arange(n))
+    ok = (area * px_m2 >= 20) & (area * px_m2 <= 2000) & (med > 0.5 * thr)
+    ok[0] = False
+    return cv2.dilate(ok[lab].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+
+
+def detect_water(rgb: np.ndarray, gsd: float | None, exclude: np.ndarray | None = None) -> np.ndarray:
+    """Rivers, lakes and ponds: blue-hued, saturated, flat (not raised like a blue roof),
+    and large. `exclude` masks raised objects from the height model."""
+    hsv = cv2.cvtColor(cv2.GaussianBlur(rgb, (5, 5), 0), cv2.COLOR_RGB2HSV_FULL).astype(np.float32)
+    hue = hsv[..., 0] * 360 / 256
+    sat = hsv[..., 1] / 255
+    val = hsv[..., 2] / 255
+    m = (hue > 185) & (hue < 250) & (sat > 0.25) & (val > 0.08) & (val < 0.8)
+    k = max(3, int(round(2.0 / gsd)) | 1) if gsd else 3          # ~2 m
+    m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    min_px = max(int(2000 / gsd ** 2) if gsd else 400, 50)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    keep = np.zeros(n, bool)
+    raised_frac = (ndimage.mean(exclude, lab, np.arange(n)) if exclude is not None and n > 1
+                   else np.zeros(n))
+    for i in range(1, n):
+        # judged per region: a blue roof is almost entirely raised, a river mostly flat
+        keep[i] = stats[i, cv2.CC_STAT_AREA] >= min_px and raised_frac[i] < 0.6
+    return keep[lab]
 
 
 def ground_surface(rel: np.ndarray, gsd: float | None, window_m: float) -> np.ndarray:
@@ -118,7 +160,8 @@ def _detrend(a: np.ndarray) -> np.ndarray:
 
 def shadow_anchors(building_lab: np.ndarray, n_lab: int, shadow: np.ndarray, ndsm_rel: np.ndarray,
                    gsd: float, sun_el: float, sun_az: float, max_len_m: float = 150.0,
-                   dtm: np.ndarray | None = None) -> list[dict]:
+                   dtm: np.ndarray | None = None, off_nadir: float | None = None,
+                   view_az: float | None = None) -> list[dict]:
     """Building height from the length of the shadow it casts.
 
     On sloping ground (hill towns) a shadow falling uphill is shorter and one
@@ -128,6 +171,11 @@ def shadow_anchors(building_lab: np.ndarray, n_lab: int, shadow: np.ndarray, nds
 
     Shadows point away from the sun: in image coordinates (row down = south,
     col right = east) that direction is (cos A, -sin A) for sun azimuth A.
+
+    Off-nadir views: the roof is drawn displaced from its footprint by h*tan(off_nadir), away from
+    the satellite (view_az = direction from the ground to the satellite). The part of that shift
+    along the shadow hides (or, if opposite, lengthens) the visible shadow:
+        visible L = h * (1 / (tan(el) + s) - tan(off_nadir) * cos(view_az - sun_az))
     """
     if sun_el < MIN_SUN_ELEVATION or gsd is None:
         return []
@@ -167,6 +215,9 @@ def shadow_anchors(building_lab: np.ndarray, n_lab: int, shadow: np.ndarray, nds
 
     anchors = []
     tan_el = np.tan(np.radians(sun_el))
+    lean_along = 0.0
+    if off_nadir and view_az is not None:
+        lean_along = float(np.tan(np.radians(off_nadir)) * np.cos(np.radians(view_az - sun_az)))
     along = None
     if dtm is not None:
         gr, gc = np.gradient(ndimage.gaussian_filter(dtm.astype(np.float32), 3), gsd)
@@ -180,8 +231,13 @@ def shadow_anchors(building_lab: np.ndarray, n_lab: int, shadow: np.ndarray, nds
         k = tan_el
         if along is not None:
             k = max(tan_el + float(np.median(along[rows[sel], cols[sel]])), 0.2 * tan_el)
-        height_m = float(L_px * gsd * k)
-        spread_m = float(max(q75 - q25, 1.0) * gsd * k)
+        per_m = 1.0 / k                                  # ground shadow length per metre of height
+        if off_nadir:
+            per_m -= lean_along
+            if per_m < 0.15 / k:                         # roof hides almost all of its shadow
+                continue
+        height_m = float(L_px * gsd / per_m)
+        spread_m = float(max(q75 - q25, 1.0) * gsd / per_m)
         comp = building_lab == lab
         r_val = float(np.percentile(ndsm_rel[comp], 75))
         if height_m < 2.0 or r_val <= 0.005:
@@ -190,7 +246,22 @@ def shadow_anchors(building_lab: np.ndarray, n_lab: int, shadow: np.ndarray, nds
         anchors.append({"source": "shadow", "row": float(cy), "col": float(cx),
                         "r": r_val, "h": height_m, "spread_m": spread_m, "label": int(lab),
                         "weight": float(min(sel.sum(), 20))})
-    return anchors
+    return _clean_shadow_anchors(anchors)
+
+
+def _clean_shadow_anchors(anchors: list[dict]) -> list[dict]:
+    """Drop measurements that disagree with themselves (shadow length varies wildly along the
+    edge: usually a shaded road or slope read as a shadow) or with the rest of the town."""
+    if not anchors:
+        return anchors
+    hmax = config.get("calibration.max_building_height_m")
+    ok = [a for a in anchors if a["h"] <= hmax and a["spread_m"] <= max(6.0, 0.5 * a["h"])]
+    if len(ok) >= 8:
+        hs = np.array([a["h"] for a in ok])
+        med = float(np.median(hs))
+        mad = 1.4826 * float(np.median(np.abs(hs - med)))
+        ok = [a for a in ok if a["h"] <= med + 5 * max(mad, 1.0)]
+    return ok
 
 
 def fit_scale(anchors: list[dict]) -> dict | None:
@@ -248,6 +319,50 @@ def spatial_scale_field(anchors: list[dict], scale: float, shape: tuple[int, int
     return scale * cv2.resize(field_, (w, h), interpolation=cv2.INTER_CUBIC)
 
 
+DIRECT_BLUR_MAX_SIGMA_PX = 4.0
+
+
+def lowpass(d: np.ndarray, sigma_px: float) -> np.ndarray:
+    """Gaussian blur; for wide sigma blur at reduced resolution (same result, much faster).
+    Ported from the original DepthWizard calibrate/fit.py."""
+    if sigma_px <= DIRECT_BLUR_MAX_SIGMA_PX:
+        return cv2.GaussianBlur(d.astype(np.float32), (0, 0), sigma_px, borderType=cv2.BORDER_REFLECT)
+    h, w = d.shape
+    f = int(sigma_px // DIRECT_BLUR_MAX_SIGMA_PX)
+    small = cv2.resize(d.astype(np.float32), (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA)
+    sigma_small = np.sqrt(max(sigma_px ** 2 - f ** 2 / 12.0, 0.0)) / f
+    small = cv2.GaussianBlur(small, (0, 0), max(sigma_small, 0.1), borderType=cv2.BORDER_REFLECT)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def block_mean(x: np.ndarray, block: int) -> np.ndarray:
+    h, w = x.shape
+    hh, ww = h // block * block, w // block * block
+    return x[:hh, :ww].reshape(hh // block, block, ww // block, block).mean(axis=(1, 3))
+
+
+def band_scale(d: np.ndarray, dem: np.ndarray, dem_res_m: float, pixel_m: float) -> tuple[float, float, int]:
+    """Metres per model unit, learnt from the band the DEM itself resolves (its cell size up to a
+    few cells). Both grids are area-averaged to DEM cells and high-passed alike; the DEM's detail is
+    regressed on the model's. Returns (scale, correlation, cells). Ported from the original
+    DepthWizard; a low correlation means the model disagrees with the terrain and is not trusted."""
+    block = max(1, round(dem_res_m / pixel_m))
+    mc, dc = block_mean(d, block), block_mean(dem, block)
+    ok = np.isfinite(mc) & np.isfinite(dc)
+    cells = int(ok.sum())
+    if cells < config.get("calibration.band_min_cells"):
+        return 0.0, 0.0, cells
+    coarse = config.get("calibration.band_coarse_cells")
+
+    def detail(grid):
+        filled = np.where(ok, grid, grid[ok].mean()).astype(np.float32)
+        return (filled - cv2.GaussianBlur(filled, (0, 0), coarse, borderType=cv2.BORDER_REFLECT))[ok].astype(np.float64)
+    x, y = detail(mc), detail(dc)
+    if x.std() <= 0 or y.std() <= 0:
+        return 0.0, 0.0, cells
+    return float(np.dot(x, y) / np.dot(x, x)), float(np.corrcoef(x, y)[0, 1]), cells
+
+
 def _fuse_heights(ndsm_rel, unc_rel, scale_map, building, tree, building_lab, fit, info):
     """Shadow-first fusion.
 
@@ -280,9 +395,10 @@ def _fuse_heights(ndsm_rel, unc_rel, scale_map, building, tree, building_lab, fi
 
     measured = 0
     spreads = []
-    for a in anchors:
+    # mapped heights (OSM) win over shadow measurements of the same building
+    for a in sorted(anchors, key=lambda a: a["source"] == "osm"):
         lab = a.get("label")
-        if a["source"] != "shadow" or lab is None:
+        if a["source"] not in ("shadow", "osm") or lab is None:
             continue
         comp = building_lab == lab
         ndsm[comp] = a["h"]
@@ -291,7 +407,8 @@ def _fuse_heights(ndsm_rel, unc_rel, scale_map, building, tree, building_lab, fi
         measured += 1
     total = int(building_lab.max())
     info.update({
-        "buildings_measured_by_shadow": measured,
+        "buildings_measured_by_shadow": sum(a["source"] == "shadow" for a in anchors),
+        "buildings_measured": measured,
         "buildings_estimated_by_model": max(total - measured, 0),
         "model_height_agreement_rho": round(rho, 2),
         "model_estimate_rmse_m": round(model_rmse, 2),
@@ -306,7 +423,7 @@ def _fuse_heights(ndsm_rel, unc_rel, scale_map, building, tree, building_lab, fi
 
 # ---------------------------------------------------------------- main
 
-def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: np.ndarray | None,
+def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: "Dem | np.ndarray | None",
               p: CalibParams) -> HeightModel:
     h, w = rel.shape
     gsd = p.gsd
@@ -316,67 +433,104 @@ def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: np.nda
     ndsm_rel = np.clip(rel - ground_rel, 0, None)
     terrain_rel = _detrend(ground_rel)
 
-    water = detect_water(rgb, gsd)
+    thr = max(0.02, 0.2 * float(np.percentile(ndsm_rel, 99)))
+    raised = cv2.dilate(((ndsm_rel > thr) * 255).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    water = detect_water(rgb, gsd, exclude=raised)
     shadow = detect_shadows(rgb, water)
     veg = detect_vegetation(rgb)
 
-    thr = max(0.02, 0.2 * float(np.percentile(ndsm_rel, 99)))
     elevated = (ndsm_rel > thr) & ~water
     elevated = cv2.morphologyEx(elevated.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
     min_bldg_px = int(20 / gsd ** 2) if gsd else 15
-    tree = elevated & veg
-    building = _remove_small(elevated & ~veg, max(min_bldg_px, 6))
-    n_lab, building_lab = cv2.connectedComponents(building.astype(np.uint8), connectivity=8)
+    roofs = roof_segments(rgb, ndsm_rel, thr, shadow, gsd) & ~water
+    tree = elevated & veg & ~roofs
+    building = _remove_small((elevated & ~veg) | roofs, max(min_bldg_px, 6))
+    osm_anchors: list[dict] = []
+    if p.footprints is not None:
+        # mapped footprints: real outlines, one building each; detections outside them are kept
+        f_lab, f_heights, f_src = p.footprints
+        inside = f_lab > 0
+        _, extra = cv2.connectedComponents((building & ~inside).astype(np.uint8), connectivity=8)
+        building_lab = np.where(inside, f_lab, np.where(extra > 0, extra + f_lab.max(), 0)).astype(np.int32)
+        building = building_lab > 0
+        tree &= ~inside
+        n_lab = int(building_lab.max()) + 1
+        for i, hgt in enumerate(f_heights, start=1):
+            comp = f_lab == i
+            if hgt and comp.any():
+                cy, cx = ndimage.center_of_mass(comp)
+                osm_anchors.append({"source": "osm", "row": float(cy), "col": float(cx), "label": i,
+                                    "r": float(np.percentile(ndsm_rel[comp], 75)), "h": float(hgt),
+                                    "spread_m": 1.5, "weight": 10.0})
+        info["osm_buildings"] = int(f_lab.max())
+        info["osm_tagged_heights"] = len(osm_anchors)
+        info["notes"].append(f"{int(f_lab.max())} building footprints from {f_src}"
+                             + (f", {len(osm_anchors)} with tagged heights." if osm_anchors else "."))
+    else:
+        n_lab, building_lab = cv2.connectedComponents(building.astype(np.uint8), connectivity=8)
 
-    # ---- terrain
-    dtm = None
+    # ---- terrain (DEM already on the image grid in sea-level heights, see dem.get_dem)
+    if isinstance(dem, np.ndarray):
+        dem = Dem(heights=dem + (p.geoid_offset_m or 0.0), source="uploaded", res_m=30.0,
+                  datum="unknown", kind="surface")
+    D = None
     gcp_ground, gcp_elev = [], []
     for g in p.gcps:
         r = int(np.clip(round(g["v"] * (h - 1)), 0, h - 1))
         c = int(np.clip(round(g["u"] * (w - 1)), 0, w - 1))
         (gcp_ground if ndsm_rel[r, c] <= thr else gcp_elev).append((r, c, float(g["elevation"])))
 
+    sigma_dem_px = None
     if dem is not None:
-        sig = max(1.0, 15.0 / gsd) if gsd else 2.0
-        dtm = ndimage.gaussian_filter(dem.astype(np.float32), sig) + p.geoid_offset_m
-        info["terrain_source"] = "DEM"
-        if p.geoid_offset_m:
-            info["notes"].append(f"Vertical datum offset of {p.geoid_offset_m:+.1f} m applied to the DEM.")
+        D = dem.heights.astype(np.float32).copy()
+        info["notes"] += dem.notes
+        info.update(terrain_source="DEM", dem_source=dem.source, dem_datum=dem.datum,
+                    dem_res_m=round(dem.res_m, 1), dem_kind=dem.kind)
         if gcp_ground:
-            bias = float(np.median([e - dtm[r, c] for r, c, e in gcp_ground]))
-            dtm += bias
+            bias = float(np.median([e - D[r, c] for r, c, e in gcp_ground]))
+            D += bias
             info["gcp_dem_bias_m"] = bias
             info["notes"].append(f"DEM shifted by {bias:+.1f} m to match {len(gcp_ground)} ground GCPs.")
+        if gsd:
+            sigma_dem_px = config.get("calibration.band_sigma_k") * dem.res_m / gsd
     elif gcp_ground and gsd:
         pts = np.array(gcp_ground, float)
         if len(pts) >= 3:
             A = np.c_[pts[:, 1], pts[:, 0], np.ones(len(pts))]
             coef, *_ = np.linalg.lstsq(A, pts[:, 2], rcond=None)
             Y, X = np.mgrid[0:h, 0:w]
-            dtm = (coef[0] * X + coef[1] * Y + coef[2]).astype(np.float32)
+            D = (coef[0] * X + coef[1] * Y + coef[2]).astype(np.float32)
         else:
-            dtm = np.full((h, w), pts[:, 2].mean(), np.float32)
+            D = np.full((h, w), pts[:, 2].mean(), np.float32)
         info["terrain_source"] = f"plane through {len(pts)} ground GCPs"
+    surface_dem = dem is not None and dem.kind == "surface" and sigma_dem_px is not None
 
     # ---- metric anchors
     anchors: list[dict] = []
     if gsd and p.sun_elevation is not None and p.sun_azimuth is not None:
         anchors += shadow_anchors(building_lab, n_lab, shadow, ndsm_rel, gsd, p.sun_elevation, p.sun_azimuth,
-                                  dtm=dtm)
+                                  dtm=D, off_nadir=p.off_nadir, view_az=p.view_azimuth)
+        if p.off_nadir and p.view_azimuth is not None:
+            info["notes"].append(f"Shadow heights corrected for the {p.off_nadir:.0f} degree off-nadir view "
+                                 "(leaning buildings hide or lengthen their shadows).")
         info["shadow_anchors"] = len(anchors)
-        if dtm is not None:
+        if D is not None:
             info["notes"].append("Shadow heights corrected for terrain slope (from the DEM).")
     elif not gsd:
         info["notes"].append("Pixel size unknown: shadow calibration disabled.")
     else:
         info["notes"].append("Sun angles unknown: shadow calibration disabled.")
 
-    if dtm is not None:
+    anchors += osm_anchors
+    if D is not None and gcp_elev:
+        # on a surface DEM the GCP stands above the DEM's blurred surface: compare with the
+        # model's detail in the same band (original Method B, GCP scale source)
+        feat = ndsm_rel - lowpass(ndsm_rel, sigma_dem_px) if surface_dem else ndsm_rel
         for r, c, e in gcp_elev:
-            anchors.append({"source": "gcp", "row": r, "col": c, "r": float(ndsm_rel[r, c]),
-                            "h": e - float(dtm[r, c]), "weight": 20.0})
+            anchors.append({"source": "gcp", "row": r, "col": c, "r": float(feat[r, c]),
+                            "h": e - float(D[r, c]), "weight": 20.0})
 
-    # ---- height scale
+    # ---- height scale: GCPs + shadows, then the DEM band, then the user's estimate
     fit = fit_scale(anchors) if anchors else None
     scale_map = None
     if fit:
@@ -390,7 +544,15 @@ def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: np.nda
         info.update({k: v for k, v in fit.items() if k != "anchors"})
         info["anchors"] = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in a.items()}
                            for a in fit["anchors"]]
-    elif p.building_height_prior_m:
+    if scale_map is None and dem is not None and gsd:
+        s_band, r_band, cells = band_scale(rel, D, dem.res_m, gsd)
+        info.update(band_r=round(r_band, 3), band_cells=cells)
+        if r_band >= config.get("calibration.band_min_r") and s_band > 0:
+            scale_map = np.full((h, w), s_band, np.float32)
+            info["scale_source"] = "dem_band"
+            info["notes"].append(f"No shadows or GCPs: building scale learnt from the detail the DEM itself "
+                                 f"resolves (agreement r = {r_band:.2f}; medium confidence).")
+    if scale_map is None and p.building_height_prior_m:
         bvals = ndsm_rel[building] if building.any() else ndsm_rel
         ref = float(np.percentile(bvals, 99))
         if ref > 0:
@@ -408,13 +570,23 @@ def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: np.nda
         height_unit = "relative"
         sigma_n = 2 * unc_rel + 0.02
 
-    if dtm is not None and height_unit == "m":
+    dtm = None
+    if D is not None and height_unit == "m":
+        if surface_dem:
+            # the DEM already holds the buildings blurred over ~one cell: remove that blur from the
+            # ground and add the sharp model detail, so nothing is counted twice
+            dtm = D - lowpass(ndsm.astype(np.float32), sigma_dem_px)
+            info["notes"].append("Surface DEM: blurred buildings removed from the ground before adding sharp "
+                                 "building heights (no double counting).")
+        else:
+            dtm = D
         mode, dsm = "absolute", dtm + ndsm
         sigma = np.sqrt(sigma_n ** 2 + DEM_SIGMA_M ** 2)
-    elif dtm is not None:
-        mode, dsm, sigma = "terrain_only", dtm.copy(), np.full((h, w), DEM_SIGMA_M, np.float32)
-        info["notes"].append("Terrain is in metres but building heights could not be scaled. "
-                             "Add sun angles + pixel size, GCPs, or a typical building height.")
+    elif D is not None:
+        dtm = D
+        mode, dsm, sigma = "terrain_only", D.copy(), np.full((h, w), DEM_SIGMA_M, np.float32)
+        info["notes"].append("Terrain is in metres but building heights could not be scaled, so the DSM is the "
+                             "DEM. Add sun angles + pixel size, GCPs, or a typical building height.")
     elif height_unit == "m":
         mode, dsm, sigma = "above_ground", ndsm.copy(), sigma_n
         info["notes"].append("Heights are metres above local ground; no DEM, so terrain shape is not in metres.")

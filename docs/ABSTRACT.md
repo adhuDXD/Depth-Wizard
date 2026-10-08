@@ -1,5 +1,7 @@
 # DepthWizard: abstract
 
+Smart India Hackathon 2026 · Problem statement SIH26175 · ISRO
+
 Free elevation data for India, such as CartoDEM, SRTM and Copernicus GLO-30, is posted at about 30 m. At that resolution hills and valleys appear, but individual houses, trees and streets do not. Disaster planners need exactly that missing detail. They need to know which buildings will flood, which are tall enough to shelter on, which streets may be blocked by debris, and which way people should walk to reach safety. LiDAR and stereo surveys can supply it, but they are slow and costly. AI depth models, for their part, return unitless numbers.
 
 DepthWizard is a web application. It turns a single satellite image (PNG, JPG or GeoTIFF) into a digital surface model and then into an evacuation plan. The pipeline works as follows:

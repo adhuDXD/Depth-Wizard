@@ -21,7 +21,10 @@ from rasterio import features
 from . import render
 from .calibrate import CalibParams, HeightModel, calibrate
 from .depth import estimate_relative_height, load_default_model
-from .hazards import ScenarioResult, Terrain, build_terrain, route_from, run_scenario
+from .hazards import COVER, ScenarioResult, Terrain, build_terrain, cover_rgb, route_from, run_scenario
+from . import config
+from .dem import Dem, get_dem
+from .osm import get_buildings
 from .scene import Scene, load_dem, load_image
 from .sun import sun_position
 from .validate import compare
@@ -46,14 +49,45 @@ class Job:
     validation: dict | None = None
     truth: np.ndarray | None = None
     sun_source: str | None = None
+    dem: Dem | None = None
+    stored: Path | None = None           # saved result folder, loaded on first use
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class JobManager:
-    def __init__(self, model=None):
+    def __init__(self, model=None, store: Path | None = None):
         self.model = model or load_default_model()
         self.jobs: dict[str, Job] = {}
         self.pool = ThreadPoolExecutor(max_workers=1)
+        self.store = store
+        if store is not None:
+            self._index_saved()
+
+    # ------------------------------------------------------------------ persistence
+    def _index_saved(self) -> None:
+        """Finished results from earlier runs (the original app's terrain switcher)."""
+        for meta_file in sorted(self.store.glob("*/job.json")):
+            try:
+                m = json.loads(meta_file.read_text())
+            except (OSError, ValueError):
+                continue
+            self.jobs[m["id"]] = Job(id=m["id"], name=m["name"], params=m.get("params", {}), status="done",
+                                     progress=1.0, message="Done", created=m["created"], stored=meta_file.parent)
+
+    def ensure_loaded(self, job: Job) -> Job:
+        if job.stored is not None and job.hm is None:
+            with job.lock:
+                if job.hm is None:
+                    _load_job(job)
+        return job
+
+    def _save(self, job: Job) -> None:
+        if self.store is None:
+            return
+        try:
+            _save_job(job, self.store / job.id)
+        except OSError:
+            traceback.print_exc()
 
     def submit(self, name: str, image: str, dem: str | None, truth: str | None, params: dict) -> Job:
         job = Job(id=uuid.uuid4().hex[:12], name=name, params=params)
@@ -80,38 +114,61 @@ class JobManager:
             scene = load_image(image, gsd_hint=p.get("gsd"))
             notes = []
 
+            notes += scene.notes or []
             el, az = p.get("sun_elevation"), p.get("sun_azimuth")
+            acquired = p.get("acquired") or scene.acquired
             if el is not None and az is not None:
                 job.sun_source = "entered by user"
             elif scene.sun_elevation is not None and scene.sun_azimuth is not None:
                 el, az = scene.sun_elevation, scene.sun_azimuth
                 job.sun_source = "image metadata"
-            elif p.get("acquired") and scene.georeferenced:
-                when = datetime.fromisoformat(p["acquired"].replace("Z", "+00:00"))
+            elif acquired and scene.georeferenced:
+                when = datetime.fromisoformat(acquired.replace("Z", "+00:00"))
                 lon, lat = scene.center_lonlat()
                 el, az = sun_position(when, lat, lon)
                 job.sun_source = "computed from acquisition time"
             scene.sun_elevation, scene.sun_azimuth = el, az
+            off_nadir = p.get("off_nadir") if p.get("off_nadir") is not None else scene.off_nadir
+            view_az = p.get("view_azimuth") if p.get("view_azimuth") is not None else scene.view_azimuth
+            scene.off_nadir, scene.view_azimuth = off_nadir, view_az
 
-            if dem_path:
-                report(0.05, "Aligning DEM")
+            if scene.georeferenced:
+                report(0.04, "Preparing the DEM" if dem_path else "Fetching Copernicus DEM (cached after first use)")
                 try:
-                    scene.dem = load_dem(dem_path, scene)
-                except ValueError as e:
+                    job.dem = get_dem(scene, dem_path, manual_offset_m=p.get("geoid_offset_m") or None,
+                                      kind=p.get("dem_kind"))
+                except (ValueError, OSError) as e:
                     notes.append(f"DEM ignored: {e}")
+                if job.dem is None:
+                    notes.append("No DEM available (none uploaded, Copernicus not reachable): terrain is not in metres.")
+                scene.dem = job.dem.heights if job.dem is not None else None
+            elif dem_path:
+                notes.append("DEM ignored: a DEM can only be aligned with a georeferenced (GeoTIFF) image.")
+            footprints = None
+            if scene.georeferenced and (p.get("osm_path") or p.get("osm_fetch", True)):
+                report(0.06, "Looking up mapped buildings (OpenStreetMap)")
+                footprints = get_buildings(scene, p.get("osm_path"), allow_fetch=bool(p.get("osm_fetch", True)))
+            gcps = list(p.get("gcps") or [])
+            if p.get("gcps_csv"):
+                gcps += read_gcps_csv(p["gcps_csv"], scene)
             job.scene = scene
 
             def depth_progress(f, m):
                 report(0.08 + 0.72 * f, m)
-            rel, unc = estimate_relative_height(scene.rgb, self.model, tta=p.get("tta", True),
-                                                progress=depth_progress)
+            rel, unc = estimate_relative_height(
+                scene.rgb, self.model, tile=config.get("depth.tile_size"),
+                overlap=config.get("depth.tile_overlap"), tta=p.get("tta", config.get("depth.tta")),
+                progress=depth_progress, trim_frac=config.get("depth.align_trim_frac"))
 
             report(0.82, "Calibrating heights")
-            cp = CalibParams(gsd=scene.gsd, sun_elevation=el, sun_azimuth=az, gcps=p.get("gcps") or [],
-                             geoid_offset_m=float(p.get("geoid_offset_m") or 0.0),
-                             building_height_prior_m=p.get("building_height_prior_m"))
-            hm = calibrate(scene.rgb, rel, unc, scene.dem, cp)
+            cp = CalibParams(gsd=scene.gsd, sun_elevation=el, sun_azimuth=az, gcps=gcps,
+                             building_height_prior_m=p.get("building_height_prior_m"),
+                             off_nadir=off_nadir, view_azimuth=view_az, footprints=footprints,
+                             ground_window_m=config.get("calibration.ground_window_m"))
+            hm = calibrate(scene.rgb, rel, unc, job.dem, cp)
             hm.info["notes"] = notes + hm.info["notes"]
+            if gcps:
+                hm.info["gcps_used"] = len(gcps)
             job.hm = hm
 
             report(0.9, "Analysing terrain and drainage")
@@ -122,6 +179,7 @@ class JobManager:
                 self.attach_reference(job, truth_path)
             report(1.0, "Done")
             job.status = "done"
+            self._save(job)
         except Exception as e:  # noqa: BLE001 - surfaced to the user
             traceback.print_exc()
             job.status, job.error, job.message = "error", str(e), "Failed"
@@ -146,6 +204,36 @@ class JobManager:
 
 # ---------------------------------------------------------------------- helpers
 
+def read_gcps_csv(path: str, scene: Scene) -> list[dict]:
+    """Ground control points from CSV (original DepthWizard format): columns x,y,height_m in the
+    image CRS, or lon,lat,height_m, or u,v,elevation in normalised image coordinates."""
+    import csv
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = [{k.strip().lower(): v for k, v in r.items()} for r in csv.DictReader(f)]
+    if not rows:
+        raise ValueError("The GCP file has no rows.")
+    h, w = scene.shape
+    out = []
+    for r in rows:
+        height = float(r.get("height_m") or r.get("elevation") or r.get("height"))
+        if "u" in r and "v" in r:
+            u, v = float(r["u"]), float(r["v"])
+        else:
+            if not scene.georeferenced:
+                raise ValueError("x/y or lon/lat GCPs need a georeferenced image.")
+            if "lon" in r and "lat" in r:
+                x, y = Transformer.from_crs("EPSG:4326", scene.crs, always_xy=True).transform(
+                    float(r["lon"]), float(r["lat"]))
+            else:
+                x, y = float(r["x"]), float(r["y"])
+            c, rr = ~scene.transform @ (x, y)
+            u, v = c / w, rr / h
+        if 0 <= u <= 1 and 0 <= v <= 1:
+            out.append({"u": u, "v": v, "elevation": height})
+    return out
+
+
+
 def meta(job: Job, model) -> dict:
     out = {"id": job.id, "name": job.name, "status": job.status, "progress": job.progress,
            "message": job.message, "error": job.error, "created": job.created,
@@ -160,6 +248,9 @@ def meta(job: Job, model) -> dict:
         "center_lonlat": s.center_lonlat(),
         "extent_m": [w * s.gsd, h * s.gsd] if s.gsd else None,
         "sun": {"elevation": s.sun_elevation, "azimuth": s.sun_azimuth, "source": job.sun_source},
+        "view": {"off_nadir": s.off_nadir, "azimuth": s.view_azimuth},
+        "dem": ({"source": job.dem.source, "datum": job.dem.datum, "res_m": round(job.dem.res_m, 1),
+                 "kind": job.dem.kind} if job.dem is not None else None),
         "mode": hm.mode, "height_unit": hm.height_unit, "has_dem": s.dem is not None,
         "dsm_range": [float(finite.min()), float(finite.max())],
         "building_height_p95": float(np.percentile(hm.ndsm[hm.building], 95)) if hm.building.any() else None,
@@ -169,12 +260,20 @@ def meta(job: Job, model) -> dict:
     return out
 
 
-def heightmap(job: Job, max_dim: int = 512) -> tuple[bytes, int, int]:
-    dsm = job.hm.dsm
+def heightmap(job: Job, max_dim: int = 1024, which: str = "dsm") -> tuple[bytes, int, int]:
+    """DSM for the 3D mesh. Full resolution for normal scenes; when a scene is
+    larger, nearest-neighbour sampling keeps building walls vertical instead of
+    smearing them into slopes."""
+    if which == "dem":
+        if job.dem is None:
+            raise KeyError("dem")
+        dsm = job.dem.heights
+    else:
+        dsm = job.hm.dsm
     h, w = dsm.shape
     s = max(h, w) / max_dim
     if s > 1:
-        dsm = cv2.resize(dsm, (round(w / s), round(h / s)), interpolation=cv2.INTER_AREA)
+        dsm = cv2.resize(dsm, (round(w / s), round(h / s)), interpolation=cv2.INTER_NEAREST)
     return dsm.astype("<f4").tobytes(), dsm.shape[1], dsm.shape[0]
 
 
@@ -192,6 +291,21 @@ def layer_png(job: Job, name: str) -> bytes:
         gray = cv2.cvtColor(cv2.cvtColor(s.rgb, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB) // 2
         m = (hm.building | hm.tree)[..., None]
         img = np.where(m, col, gray)
+    elif name == "slope":
+        # slope of the bare ground (what landslides depend on); buildings greyed out
+        t = job.terrain
+        slope = cv2.resize(t.slope_deg.astype(np.float32), (s.rgb.shape[1], s.rgb.shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
+        img = render.colormap(slope, render.SLOPE, 0, 60)
+        img[hm.building] = [110, 110, 110]
+    elif name == "landcover":
+        t = job.terrain
+        cov = cv2.resize(cover_rgb(t), (s.rgb.shape[1], s.rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        img = cov.copy()
+        img[hm.building] = dict((c, col) for c, _, col in COVER)[4]
+        img[hm.water] = dict((c, col) for c, _, col in COVER)[5]
+        gray = cv2.cvtColor(cv2.cvtColor(s.rgb, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+        img = (0.7 * img + 0.3 * gray).astype(np.uint8)
     elif name == "confidence":
         img = render.CONFIDENCE[hm.confidence]
     elif name == "drainage":
@@ -221,6 +335,7 @@ def point_info(job: Job, u: float, v: float) -> dict:
            "uncertainty": float(hm.sigma[r, c]), "confidence": ["low", "medium", "high"][int(hm.confidence[r, c])],
            "is_building": bool(hm.building[r, c]), "is_water": bool(hm.water[r, c]),
            "slope_deg": round(float(T.slope_deg[tr, tc]), 1),
+           "land_cover": "building" if hm.building[r, c] else COVER[int(T.cover[tr, tc])][1],
            "height_above_drainage": float(T.hydro.hand[tr, tc]), "unit": hm.height_unit}
     if job.scene.georeferenced:
         x, y = job.scene.transform @ (c + 0.5, r + 0.5)
@@ -369,3 +484,59 @@ blue/red/orange = danger zone, red ! = choke point{', pink line = selected route
 <p class="warn">Pre-disaster planning aid made from a single satellite image. Not a live navigation system.
 Check routes on the ground before relying on them. Population figures are estimates from building volume.</p>
 <script>window.onload=()=>setTimeout(()=>window.print(),400)</script></body></html>"""
+
+
+# ---------------------------------------------------------------------- saved results
+
+_HM_ARRAYS = ("rel", "unc_rel", "terrain_rel", "ndsm_rel", "ndsm", "dtm", "dsm", "sigma", "confidence",
+              "building", "tree", "water", "shadow")
+
+
+def _jsonable(o):
+    if isinstance(o, (np.floating, np.integer)):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(type(o))
+
+
+def _save_job(job: Job, folder: Path) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    s, hm = job.scene, job.hm
+    arrays = {f"hm_{k}": getattr(hm, k) for k in _HM_ARRAYS if getattr(hm, k) is not None}
+    arrays["rgb"] = s.rgb
+    if job.dem is not None:
+        arrays["dem"] = job.dem.heights
+    if job.truth is not None:
+        arrays["truth"] = job.truth
+    np.savez_compressed(folder / "arrays.npz", **arrays)
+    meta_ = {
+        "id": job.id, "name": job.name, "params": job.params, "created": job.created,
+        "sun_source": job.sun_source, "validation": job.validation,
+        "scene": {"gsd": s.gsd, "transform": list(s.transform)[:6] if s.transform else None, "crs": s.crs,
+                  "sun_elevation": s.sun_elevation, "sun_azimuth": s.sun_azimuth, "off_nadir": s.off_nadir,
+                  "view_azimuth": s.view_azimuth, "acquired": s.acquired},
+        "hm": {"mode": hm.mode, "height_unit": hm.height_unit, "info": hm.info},
+        "dem": ({"source": job.dem.source, "res_m": job.dem.res_m, "datum": job.dem.datum, "kind": job.dem.kind}
+                if job.dem is not None else None),
+    }
+    (folder / "job.json").write_text(json.dumps(meta_, default=_jsonable))
+
+
+def _load_job(job: Job) -> None:
+    from rasterio.transform import Affine
+    folder = job.stored
+    m = json.loads((folder / "job.json").read_text())
+    a = np.load(folder / "arrays.npz")
+    sc = m["scene"]
+    job.scene = Scene(rgb=a["rgb"], gsd=sc["gsd"], transform=Affine(*sc["transform"]) if sc["transform"] else None,
+                      crs=sc["crs"], sun_elevation=sc["sun_elevation"], sun_azimuth=sc["sun_azimuth"],
+                      off_nadir=sc.get("off_nadir"), view_azimuth=sc.get("view_azimuth"), acquired=sc.get("acquired"))
+    if m.get("dem"):
+        job.dem = Dem(heights=a["dem"], **m["dem"])
+        job.scene.dem = job.dem.heights
+    kw = {k: (a[f"hm_{k}"] if f"hm_{k}" in a.files else None) for k in _HM_ARRAYS}
+    job.hm = HeightModel(mode=m["hm"]["mode"], height_unit=m["hm"]["height_unit"], info=m["hm"]["info"], **kw)
+    job.truth = a["truth"] if "truth" in a.files else None
+    job.validation, job.sun_source = m.get("validation"), m.get("sun_source")
+    job.terrain = build_terrain(job.hm, job.scene.gsd, job.scene.rgb)

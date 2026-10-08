@@ -74,39 +74,86 @@ def load_default_model():
     return HeuristicDepthModel()
 
 
-def _align(pred: np.ndarray, ref: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
-    """Least-squares scale/shift so that s*pred + t ~= ref."""
-    p, r = pred.ravel(), ref.ravel()
-    if mask is not None:
-        m = mask.ravel()
-        p, r = p[m], r[m]
-    if p.size > 20000:
-        idx = np.random.default_rng(0).choice(p.size, 20000, replace=False)
-        p, r = p[idx], r[idx]
-    A = np.stack([p, np.ones_like(p)], 1)
-    (s, t), *_ = np.linalg.lstsq(A, r, rcond=None)
-    if not np.isfinite(s) or s <= 0:
-        s = (r.std() + 1e-6) / (p.std() + 1e-6)
-        t = r.mean() - s * p.mean()
-    return s * pred + t
+def _fit_affine(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    xm, ym = x.mean(), y.mean()
+    var = np.mean((x - xm) ** 2)
+    if var <= np.finfo(np.float32).eps:            # featureless: carry the level only
+        return 0.0, float(ym)
+    a = np.mean((x - xm) * (y - ym)) / var
+    return float(a), float(ym - a * xm)
 
 
-def _feather(h: int, w: int, ramp: int) -> np.ndarray:
-    def ramp1d(n):
-        x = np.ones(n, np.float32)
-        r = min(ramp, n // 2)
-        if r > 0:
-            edge = (np.arange(r, dtype=np.float32) + 1) / (r + 1)
-            x[:r], x[-r:] = edge, edge[::-1]
-        return x
-    return np.outer(ramp1d(h), ramp1d(w)) + 1e-3
+def align_params(t: np.ndarray, g: np.ndarray, trim_frac: float = 0.05) -> tuple[float, float]:
+    """alpha, beta minimising |alpha*t + beta - g|^2 over all but the largest residuals.
+
+    Robust start (median / MAD), then two trimmed refits: a plain least-squares start lets a few
+    extreme pixels (water noise) drag the slope to ~0, after which trimming can't find them.
+    (Ported from the original DepthWizard depth/stitch.py.)"""
+    x = t.ravel().astype(np.float64)
+    y = g.ravel().astype(np.float64)
+    if x.size > 40000:
+        idx = np.random.default_rng(0).choice(x.size, 40000, replace=False)
+        x, y = x[idx], y[idx]
+    mx, my = np.median(x), np.median(y)
+    sx, sy = np.median(np.abs(x - mx)), np.median(np.abs(y - my))
+    if sx <= np.finfo(np.float32).eps:
+        return 0.0, float(my)
+    a, b = sy / sx, my - sy / sx * mx
+    for _ in range(2):
+        resid = np.abs(a * x + b - y)
+        keep = resid <= np.quantile(resid, 1.0 - trim_frac)
+        a, b = _fit_affine(x[keep], y[keep])
+    if a <= 0:                                     # never flip a tile's sign
+        a = (y.std() + 1e-6) / (x.std() + 1e-6)
+        b = float(y.mean() - a * x.mean())
+    return a, b
 
 
-def _tile_starts(n: int, tile: int, step: int) -> list[int]:
-    if n <= tile:
+def _align(pred: np.ndarray, ref: np.ndarray, trim_frac: float = 0.05) -> np.ndarray:
+    a, b = align_params(pred, ref, trim_frac)
+    return a * pred + b
+
+
+def tile_origins(length: int, tile: int, stride: int) -> list[int]:
+    """Start offsets of tiles covering [0, length); the last tile sits flush with the end."""
+    if length <= tile:
         return [0]
-    starts = list(range(0, n - tile, step)) + [n - tile]
-    return sorted(set(starts))
+    starts = list(range(0, length - tile + 1, stride))
+    if starts[-1] != length - tile:
+        starts.append(length - tile)
+    return starts
+
+
+def taper(n: int, flat_start: bool, flat_end: bool) -> np.ndarray:
+    """1D sin^2 (Hann) window; at 50% overlap neighbouring windows sum to 1. A side on the image
+    boundary is held at full weight, otherwise edge pixels would get ~zero total weight."""
+    w = np.sin(np.pi * (np.arange(n) + 0.5) / n) ** 2
+    half = n // 2
+    if flat_start:
+        w[:half] = 1.0
+    if flat_end:
+        w[half:] = 1.0
+    return w.astype(np.float32)
+
+
+def window2d(y: int, x: int, th: int, tw: int, height: int, width: int) -> np.ndarray:
+    return np.outer(taper(th, y == 0, y + th >= height), taper(tw, x == 0, x + tw >= width)) + 1e-6
+
+
+def seam_ratio(d: np.ndarray, tile: int, stride: int) -> float:
+    """Mean |gradient| across tile borders / mean elsewhere. ~1.0 means invisible seams."""
+    h, w = d.shape
+    gx, gy = np.abs(np.diff(d, axis=1)), np.abs(np.diff(d, axis=0))
+
+    def borders(n):
+        edges = {e for s0 in tile_origins(n, tile, stride) for e in (s0, s0 + tile) if 0 < e < n}
+        m = np.zeros(n - 1, bool)
+        m[[e - 1 for e in edges]] = True
+        return m
+    on_x, on_y = borders(w), borders(h)
+    border = np.concatenate([gx[:, on_x].ravel(), gy[on_y, :].ravel()])
+    inner = np.concatenate([gx[:, ~on_x].ravel(), gy[~on_y, :].ravel()])
+    return float(border.mean() / max(inner.mean(), 1e-12))
 
 
 def _tta(model, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -119,10 +166,13 @@ def _tta(model, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return aligned.mean(0), aligned.std(0)
 
 
-def estimate_relative_height(rgb: np.ndarray, model, tile: int = 518, overlap: float = 0.25,
-                             tta: bool = True, progress: Progress | None = None
-                             ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (relative height in [0, 1], uncertainty in the same units)."""
+def estimate_relative_height(rgb: np.ndarray, model, tile: int = 518, overlap: float = 0.5,
+                             tta: bool = True, progress: Progress | None = None,
+                             trim_frac: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
+    """Return (relative height in [0, 1], uncertainty in the same units).
+
+    Global pass G, then native-resolution tiles at 50% overlap, each aligned to G with a robust
+    trimmed affine fit and blended with Hann windows (original DepthWizard Stage 2)."""
     report = progress or (lambda f, m: None)
     h, w = rgb.shape[:2]
     report(0.05, "Global depth pass")
@@ -133,15 +183,15 @@ def estimate_relative_height(rgb: np.ndarray, model, tile: int = 518, overlap: f
 
     rel = glob
     if max(h, w) > tile * 1.25:
-        step = int(tile * (1 - overlap))
+        stride = max(1, int(tile * (1 - overlap)))
         acc = np.zeros((h, w), np.float64)
         wsum = np.zeros((h, w), np.float64)
-        boxes = [(y, x) for y in _tile_starts(h, tile, step) for x in _tile_starts(w, tile, step)]
+        boxes = [(y, x) for y in tile_origins(h, tile, stride) for x in tile_origins(w, tile, stride)]
         for i, (y, x) in enumerate(boxes):
             report(0.1 + 0.8 * i / len(boxes), f"Depth tile {i + 1}/{len(boxes)}")
             crop = rgb[y:y + tile, x:x + tile]
-            pred = _align(model.infer(crop), glob[y:y + tile, x:x + tile])
-            wt = _feather(*pred.shape, ramp=int(tile * overlap))
+            pred = _align(model.infer(crop), glob[y:y + tile, x:x + tile], trim_frac)
+            wt = window2d(y, x, pred.shape[0], pred.shape[1], h, w)
             acc[y:y + tile, x:x + tile] += wt * pred
             wsum[y:y + tile, x:x + tile] += wt
         rel = (acc / wsum).astype(np.float32)

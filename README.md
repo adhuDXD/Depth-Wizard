@@ -2,6 +2,8 @@
 
 **One satellite image → a metric 3D surface model → a disaster evacuation plan.**
 
+Smart India Hackathon 2026 · Problem statement **SIH26175** · ISRO
+
 DepthWizard is a web app. Load a satellite image (PNG, JPG or GeoTIFF) and it:
 
 1. estimates the height of every building, tree and terrain feature (Depth Anything V2 + shadow geometry + DEM),
@@ -15,22 +17,26 @@ It runs on one ordinary office PC (CPU is enough). Everyone else on the network 
 
 ## Quick start
 
+**Windows, easiest way:** download the ZIP (GitHub → Code → Download ZIP), extract it, and double-click **`run_local.bat`**. The first run installs everything (about 5 minutes); after that it starts in seconds and opens http://localhost:8000. Linux/macOS: `./run_local.sh`.
+
+**Manual:**
 ```bash
 pip install -r requirements.txt
-python scripts/download_model.py          # Depth Anything V2 Small, ONNX, ~99 MB (optional but recommended)
+python scripts/download_model.py          # Depth Anything V2 Small, ONNX, ~99 MB
+python scripts/fetch_geoid.py             # EGM2008 geoid grid, ~81 MB (CartoDEM -> sea-level heights)
+python scripts/fetch_demo_namchi.py       # optional: real Namchi WorldView-3 scene (Maxar ODP, CC BY-NC 4.0)
 python -m depthwizard.server              # http://localhost:8000
 python -m depthwizard.server --host 0.0.0.0   # serve the whole office LAN
 ```
 
-Click **Try demo town** for a synthetic Namchi-like hill town with known ground truth. Or with Docker:
+Click **Try demo town** (synthetic, with ground truth) or **Real: Namchi** (real 0.3 m WorldView-3 image).
+GeoTIFFs get a **Copernicus 30 m DEM automatically** (cached for offline use). Without the model
+file the app still runs on a clearly labelled non-AI fallback.
 
-```bash
-docker build -t depthwizard . && docker run -p 8000:8000 depthwizard
-```
+Ideas and code ported from the team's original desktop repo are listed in
+[docs/PORTED_FROM_ORIGINAL.md](docs/PORTED_FROM_ORIGINAL.md).
 
-Without the model file the app still works, but it uses a clearly labelled non-AI fallback.
-
-**Footprint:** about 0.8 GB installed (Python libraries ~735 MB + model 99 MB). No PyTorch, CUDA or GPU needed, and processing a 1024 px scene takes ~8 s on a laptop CPU. The previous desktop build was 4.7 GB.
+**Footprint:** about 0.8 GB installed (Python libraries ~735 MB + model 99 MB). No PyTorch, CUDA or GPU needed, and a 2048 px scene takes ~40 s on a laptop CPU (1024 px: ~10 s). The previous desktop build was 4.7 GB.
 
 ---
 
@@ -58,10 +64,11 @@ DEM ─► + datum offset ─► terrain (DTM)│◄── GCPs (fix DEM bias, a
 |---|---|
 | Tiled AI depth | Global pass plus overlapping tiles. Each tile is fitted to the global pass, so there are no seams. Test-time augmentation gives an uncertainty map. |
 | Ground / object split | A morphological opening separates terrain from objects. Objects split into buildings and trees using an excess-green vegetation index. |
-| **Shadow measurement** | Each building's shadow is walked along the sun azimuth. Height = length × GSD × (tan(elevation) + **terrain slope along the shadow**). The slope comes from the DEM: on a hillside, shadows falling uphill are shorter and ones falling downhill longer. Truncated shadows and ones that hit image edges are discarded. |
+| **Shadow measurement** | Each building's shadow is walked along the sun azimuth; **off-nadir lean** (roofs drawn shifted away from the satellite) is corrected. Height = length × GSD × (tan(elevation) + **terrain slope along the shadow**). The slope comes from the DEM: on a hillside, shadows falling uphill are shorter and ones falling downhill longer. Truncated shadows and ones that hit image edges are discarded. |
 | **Shadow-first fusion** | Buildings with a measured shadow get that physical height. The others get the AI estimate, **shrunk toward typical measured heights by how well the AI agrees with the measurements** (ρ). The app reports ρ, so an AI that doesn't track heights isn't trusted to invent them. |
 | Robust scale | Median ratio with MAD outlier rejection, a smooth spatial field once there are ≥ 12 anchors, and leave-one-out error. |
-| Terrain | DEM resampled to the image grid, plus the vertical datum offset (e.g. −46 m for CartoDEM at Namchi), plus a bias fix from ground GCPs. |
+| Terrain | Uploaded DEM or **Copernicus GLO-30 fetched automatically**; CartoDEM converted to EGM2008 with the geoid grid (N = −43.8 m at Namchi) or by a datum check against Copernicus; ground-GCP bias fix. A surface DEM's blurred buildings are removed from the ground (original Method B). |
+| Other scale sources | **GCP CSV**, **OSM footprints/heights** (Overpass, cached, or uploaded GeoJSON), the **DEM band** (original repo), or a typical-height estimate. |
 
 **Honesty modes.** Every output is labelled with one of these modes:
 
@@ -74,21 +81,31 @@ DEM ─► + datum offset ─► terrain (DTM)│◄── GCPs (fix DEM bias, a
 
 ### Escape routing (`depthwizard/hydrology.py`, `hazards.py`, `routing.py`)
 
-* **Flood.** Priority-flood depression filling, D8 flow, accumulation and **HAND** (height above nearest drainage). A water rise of *h* floods every cell with HAND < *h*. **Buildings whose roof stays ≥ 3 m above the water and that are ≥ 9 m tall become vertical-evacuation refuges.** This uses the estimated heights.
-* **Landslide.** Susceptibility from slope, flow convergence and bare ground, plus a downslope run-out along D8 paths.
+* **Flood.** Rivers, lakes and ponds are **detected in the image** (blue hue, flat, large). The water level starts at **0** (normal conditions) and the flood **spreads outward from those water bodies**: every cell's height above the water body it drains into is computed along D8 flow paths, and a rise of *h* floods the connected cells less than *h* above the water. With no water body in view, the terrain's drainage network (HAND) is the source. **Buildings whose roof stays ≥ 3 m above the water and that are ≥ 9 m tall become vertical-evacuation refuges.** This uses the estimated heights.
+* **Landslide.** Every cell is first classified as **building, hillside / mountain slope (≥ 15°), vegetated slope, flat ground or water** (Expert → *Land cover*). Slopes are measured on the **bare ground**: building cells are refilled from the ground around them, so walls never look like cliffs. A slide can only **start on natural slopes**, never on a roof or within 4 m of a wall, and source patches under 150 m² are dropped. Susceptibility comes from slope, flow convergence and bare ground. Debris runs downslope along D8 paths for up to 100 m; buildings in that path are marked **at risk** (purple), not as landslides. Without a DEM, slopes are put in metres using the building height scale, so a flat town is not mistaken for hills.
 * **Earthquake.** Debris from a building can reach ~0.5 × its height. Streets inside that reach are penalised, and open ground beyond it becomes an assembly area. This also uses the estimated heights.
 * **Routing.** 8-connected grid. Cost = distance ÷ **Tobler hiking speed** (uphill/downhill aware) × hazard penalty. One Dijkstra run from a virtual "safety" node on the reversed graph gives every cell its time-to-safety and next step.
 * **People.** Population is estimated from building volume (floors × footprint ÷ 15 m²/person). Shelter capacity uses the Sphere 3.5 m²/person standard. Flow through the route tree gives the choke points.
 
 ### Demo-town validation (synthetic, known truth; `Expert → Validation`)
 
+The demo DEM behaves like CartoDEM: a 30 m surface model, ellipsoidal (43.8 m below sea level at Namchi).
+
 | Surface RMSE | Whole scene | Buildings & trees |
 |---|---|---|
-| 30 m DEM only (datum-corrected) | 6.09 m | 11.54 m |
-| DepthWizard, Depth Anything V2 + shadows | **4.14 m** | **7.01 m** |
-| DepthWizard, non-AI fallback | 6.32 m | 11.45 m |
+| 30 m surface DEM only (datum-corrected) | 5.73 m | 10.73 m |
+| DepthWizard (Depth Anything V2 + shadows + surface-DEM correction) | **3.48 m** | **5.32 m** |
 
-Shadow-measured building heights reach 3.1 m RMSE (r = 0.91) against the truth with the slope correction, and 5.5 m (r = 0.78) without it. On this synthetic render, the AI's within-building values do **not** track height (ρ ≈ 0), so the app leans on shadows and says so. Real Indian validation still needs ICESat-2 / GEDI / field data; see `docs/IMPROVEMENT_PLAN.md`.
+The surface-DEM correction ported from the original repo removes a +2 m double-counting bias.
+Shadow heights reach ~3 m RMSE with the slope correction. Real Indian validation is still to do
+(ICESat-2 / GEDI / field survey, see `docs/IMPROVEMENT_PLAN.md`); the original repo's 72-tile US
+LiDAR table remains its reference.
+
+### Real scene: Namchi, Sikkim (Maxar WorldView-3, 0.3 m, 26° off-nadir)
+
+`python scripts/fetch_demo_namchi.py`, then **Real: Namchi**: Copernicus DEM fetched automatically,
+~200 buildings measured from shadows with slope and off-nadir corrections (median ~12 m, i.e. 4 storeys),
+~40 s on a laptop CPU at 2048 px. No ground truth exists for this scene, so no accuracy is claimed.
 
 ---
 
@@ -96,7 +113,9 @@ Shadow-measured building heights reach 3.1 m RMSE (r = 0.91) against the truth w
 
 * **Guided mode** (default), in three steps: load image → read the height-model card → pick a hazard and move the slider. Tap the map for the walking route from any spot. **Print evacuation plan** opens a one-page report.
 * **Expert mode** adds:
-  * layers: surface, building heights, confidence, drainage, error, time-to-safety
+  * layers: surface, building heights, confidence, **land cover** (buildings vs hillside), **ground slope**, drainage, error, time-to-safety
+  * 3D **fly mode** (F, WASD) and **DEM only** comparison (B)
+  * **Previous results** list and `?job=` links
   * an elevation profile and a point inspector
   * a validation upload (reference DSM GeoTIFF)
   * GeoTIFF downloads
