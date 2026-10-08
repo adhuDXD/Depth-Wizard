@@ -16,6 +16,7 @@ if errorlevel 1 (
 
 fc /b requirements.txt ".venv\requirements.installed" >nul 2>nul
 if errorlevel 1 del ".venv\installed.ok" 2>nul
+ver >nul
 
 if not exist ".venv\installed.ok" (
   echo [1/3] Creating the Python environment...
