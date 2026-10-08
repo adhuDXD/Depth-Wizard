@@ -80,7 +80,7 @@ DEM ─► + datum offset ─► terrain (DTM)│◄── GCPs (fix DEM bias, a
 
 ### Escape routing (`depthwizard/hydrology.py`, `hazards.py`, `routing.py`)
 
-* **Flood.** Priority-flood depression filling, D8 flow, accumulation and **HAND** (height above nearest drainage). A water rise of *h* floods every cell with HAND < *h*. **Buildings whose roof stays ≥ 3 m above the water and that are ≥ 9 m tall become vertical-evacuation refuges.** This uses the estimated heights.
+* **Flood.** Rivers, lakes and ponds are **detected in the image** (blue hue, flat, large). The water level starts at **0** (normal conditions) and the flood **spreads outward from those water bodies**: every cell's height above the water body it drains into is computed along D8 flow paths, and a rise of *h* floods the connected cells less than *h* above the water. With no water body in view, the terrain's drainage network (HAND) is the source. **Buildings whose roof stays ≥ 3 m above the water and that are ≥ 9 m tall become vertical-evacuation refuges.** This uses the estimated heights.
 * **Landslide.** Susceptibility from slope, flow convergence and bare ground, plus a downslope run-out along D8 paths.
 * **Earthquake.** Debris from a building can reach ~0.5 × its height. Streets inside that reach are penalised, and open ground beyond it becomes an assembly area. This also uses the estimated heights.
 * **Routing.** 8-connected grid. Cost = distance ÷ **Tobler hiking speed** (uphill/downhill aware) × hazard penalty. One Dijkstra run from a virtual "safety" node on the reversed graph gives every cell its time-to-safety and next step.

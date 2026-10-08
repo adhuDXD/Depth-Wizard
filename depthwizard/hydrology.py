@@ -11,6 +11,7 @@ import heapq
 from dataclasses import dataclass
 
 import numpy as np
+from scipy import ndimage
 
 OFFSETS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
@@ -98,3 +99,32 @@ def compute_hydrology(z: np.ndarray, cell: float, stream_fraction: float = 0.01)
     hand = np.maximum(fflat - np.array(base_l), 0).reshape(h, w)
     return Hydrology(filled=filled, receivers=rec, accumulation=acc, drainage=drainage,
                      hand=hand.astype(np.float32), order_desc=order)
+
+
+def height_above_sources(hy: Hydrology, sources: np.ndarray) -> np.ndarray:
+    """Height of every cell above the water body it drains into.
+
+    Each cell follows its D8 flow path; the first source cell (river, lake)
+    on that path is its reference level. Cells whose path never meets a
+    source (it leaves the image first) use the spatially nearest source cell.
+    """
+    h, w = sources.shape
+    filled = hy.filled.ravel()
+    src = sources.ravel()
+    base = np.full(h * w, np.nan)
+    base[src] = filled[src]
+    rec = hy.receivers
+    base_l = base.tolist()
+    rec_l = rec.tolist()
+    src_l = src.tolist()
+    for i in hy.order_desc[::-1].tolist():          # low -> high: receivers first
+        if not src_l[i]:
+            j = rec_l[i]
+            if j >= 0:
+                base_l[i] = base_l[j]
+    base = np.array(base_l).reshape(h, w)
+    missing = ~np.isfinite(base)
+    if missing.any():
+        _, (ir, ic) = ndimage.distance_transform_edt(~sources, return_indices=True)
+        base[missing] = hy.filled[ir, ic][missing]
+    return np.maximum(hy.filled - base, 0).astype(np.float32)

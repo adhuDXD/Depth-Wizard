@@ -82,16 +82,26 @@ def detect_vegetation(rgb: np.ndarray) -> np.ndarray:
     return exg > 0.06
 
 
-def detect_water(rgb: np.ndarray, gsd: float | None) -> np.ndarray:
-    f = rgb.astype(np.float32)
-    r, g, b = f[..., 0], f[..., 1], f[..., 2]
-    gray = f.mean(axis=2)
-    local_std = np.sqrt(np.maximum(
-        ndimage.uniform_filter(gray ** 2, 7) - ndimage.uniform_filter(gray, 7) ** 2, 0))
-    m = (b > g * 1.03) & (b > r * 1.12) & (local_std < 10)
-    min_px = int(2000 / gsd ** 2) if gsd else 400
-    m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
-    return _remove_small(m, max(min_px, 50))
+def detect_water(rgb: np.ndarray, gsd: float | None, exclude: np.ndarray | None = None) -> np.ndarray:
+    """Rivers, lakes and ponds: blue-hued, saturated, flat (not raised like a blue roof),
+    and large. `exclude` masks raised objects from the height model."""
+    hsv = cv2.cvtColor(cv2.GaussianBlur(rgb, (5, 5), 0), cv2.COLOR_RGB2HSV_FULL).astype(np.float32)
+    hue = hsv[..., 0] * 360 / 256
+    sat = hsv[..., 1] / 255
+    val = hsv[..., 2] / 255
+    m = (hue > 185) & (hue < 250) & (sat > 0.25) & (val > 0.08) & (val < 0.8)
+    k = max(3, int(round(2.0 / gsd)) | 1) if gsd else 3          # ~2 m
+    m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    min_px = max(int(2000 / gsd ** 2) if gsd else 400, 50)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    keep = np.zeros(n, bool)
+    raised_frac = (ndimage.mean(exclude, lab, np.arange(n)) if exclude is not None and n > 1
+                   else np.zeros(n))
+    for i in range(1, n):
+        # judged per region: a blue roof is almost entirely raised, a river mostly flat
+        keep[i] = stats[i, cv2.CC_STAT_AREA] >= min_px and raised_frac[i] < 0.6
+    return keep[lab]
 
 
 def ground_surface(rel: np.ndarray, gsd: float | None, window_m: float) -> np.ndarray:
@@ -316,11 +326,12 @@ def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: np.nda
     ndsm_rel = np.clip(rel - ground_rel, 0, None)
     terrain_rel = _detrend(ground_rel)
 
-    water = detect_water(rgb, gsd)
+    thr = max(0.02, 0.2 * float(np.percentile(ndsm_rel, 99)))
+    raised = cv2.dilate(((ndsm_rel > thr) * 255).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    water = detect_water(rgb, gsd, exclude=raised)
     shadow = detect_shadows(rgb, water)
     veg = detect_vegetation(rgb)
 
-    thr = max(0.02, 0.2 * float(np.percentile(ndsm_rel, 99)))
     elevated = (ndsm_rel > thr) & ~water
     elevated = cv2.morphologyEx(elevated.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
     min_bldg_px = int(20 / gsd ** 2) if gsd else 15

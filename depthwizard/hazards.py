@@ -20,7 +20,7 @@ import numpy as np
 from scipy import ndimage
 
 from .calibrate import HeightModel
-from .hydrology import Hydrology, compute_hydrology
+from .hydrology import Hydrology, compute_hydrology, height_above_sources
 from .routing import RouteField, arrows, evacuation_field, trace
 
 FLOOR_HEIGHT_M = 3.0
@@ -31,7 +31,7 @@ REFUGE_MIN_HEIGHT_M = 9.0        # ~3 storeys
 MAX_GRID = 320
 
 HAZARDS = {
-    "flood": {"label": "Flood", "param": "Water rise above stream level", "default": 3.0, "min": 0.5, "max": 15.0},
+    "flood": {"label": "Flood", "param": "Water level rise", "default": 0.0, "min": 0.0, "max": 15.0},
     "landslide": {"label": "Landslide", "param": "Caution level", "default": 0.5, "min": 0.0, "max": 1.0},
     "earthquake": {"label": "Earthquake", "param": "Debris reach (x building height)", "default": 0.5, "min": 0.2, "max": 1.2},
 }
@@ -55,6 +55,9 @@ class Terrain:
     slope_is_metric: bool
     population: np.ndarray
     hydro: Hydrology
+    flood_ref: np.ndarray        # height above the flood source (water body, else stream network)
+    flood_seed: np.ndarray       # where the water starts
+    water_bodies: list[dict]
 
 
 def _down(a: np.ndarray, shape: tuple[int, int], interp=cv2.INTER_AREA) -> np.ndarray:
@@ -98,10 +101,34 @@ def build_terrain(hm: HeightModel, gsd: float | None, rgb: np.ndarray) -> Terrai
     population = np.where(building, cell_area * floors / M2_FLOOR_PER_PERSON, 0.0)
 
     hydro = compute_hydrology(z, cell_m)
+
+    # Water bodies seen in the image are where a flood starts. Without any,
+    # fall back to the drainage network derived from the terrain.
+    min_water_cells = max(6, int(500 / cell_area)) if gsd else 12
+    water = ndimage.binary_fill_holes(water)
+    wlab, wids = _components(water, min_water_cells, max_n=50)
+    water = np.isin(wlab, wids)
+    water_bodies = []
+    for i in wids:
+        comp = wlab == i
+        cy, cx = np.unravel_index(np.argmax(ndimage.distance_transform_edt(comp)), comp.shape)
+        rr, cc = np.nonzero(comp)
+        elong = max(np.ptp(rr), np.ptp(cc)) + 1
+        water_bodies.append({
+            "kind": "river" if elong ** 2 > 6 * comp.sum() else "lake / pond",
+            "area_m2": round(float(comp.sum() * cell_area)) if gsd else None,
+            "u": (cx + 0.5) / shape[1], "v": (cy + 0.5) / shape[0]})
+    if water.any():
+        flood_seed = water
+        flood_ref = height_above_sources(hydro, water)
+    else:
+        flood_seed = hydro.drainage
+        flood_ref = hydro.hand
     return Terrain(factor=factor, shape=shape, cell_m=cell_m, metric_xy=gsd is not None, z=z,
                    z_unit=z_unit, ndsm=ndsm, height_unit=hm.height_unit, building=building, tree=tree,
                    water=water, veg=veg, slope_deg=slope, slope_is_metric=slope_is_metric,
-                   population=population, hydro=hydro)
+                   population=population, hydro=hydro, flood_ref=flood_ref, flood_seed=flood_seed,
+                   water_bodies=water_bodies)
 
 
 def _zone_name(i: int) -> str:
@@ -146,19 +173,28 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
 
     metric_heights = T.height_unit == "m" and T.metric_xy
     if kind == "flood":
+        ref = T.flood_ref
+        has_water = bool(T.water.any())
         if T.z_unit == "relative":
-            span = float(np.ptp(T.hydro.hand)) or 1.0
+            span = float(np.ptp(ref)) or 1.0
             level_z = level / 15.0 * span          # slider maps to a share of local relief
             margin = 0.03 * span
             warnings.append("No DEM: water level is relative to local relief, not metres.")
         else:
             level_z, margin = level, 1.0
-        depth = np.clip(level_z - T.hydro.hand, 0, None)
-        danger = (depth > 0) | T.water
+        if not has_water:
+            warnings.append("No river or lake detected in the image: the flood starts from the lowest "
+                            "drainage lines of the terrain.")
+        # the flood grows outward from the water body, only through cells it can actually reach
+        reach = (ref < level_z) | T.flood_seed if level_z > 0 else T.flood_seed & T.water
+        flooded = ndimage.binary_propagation(T.flood_seed & reach, structure=np.ones((3, 3), bool), mask=reach)
+        depth = np.where(flooded, np.clip(level_z - ref, 0, None), 0.0)
+        depth[T.water] = level_z + (1.0 if T.z_unit == "m" else margin)   # existing water is deep
+        danger = flooded | T.water
         depth_n = np.clip(depth / (1.0 if T.z_unit == "m" else max(margin, 1e-6)), 0, 3)
         mult += (1.0 + depth_n) * danger
         mult[T.building & ~danger] = 4.0
-        safe = (T.hydro.hand >= level_z + margin) & ~T.building & ~T.water & (T.slope_deg < 25)
+        safe = (ref >= level_z + margin) & ~T.building & ~T.water & (T.slope_deg < 25)
         lab, ids = _components(safe, min_cells)
         for k, i in enumerate(ids):
             targets[lab == i] = k + 1
@@ -183,8 +219,10 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
                         break
         else:
             warnings.append("Building heights are not in metres, so vertical-evacuation refuges are off.")
+        new_water = danger & ~T.water
         alpha = np.clip(90 + 160 * depth_n / 3, 0, 230).astype(np.uint8)
-        overlay[danger] = np.c_[np.tile([30, 110, 230], (int(danger.sum()), 1)), alpha[danger]]
+        overlay[new_water] = np.c_[np.tile([30, 110, 230], (int(new_water.sum()), 1)), alpha[new_water]]
+        overlay[T.water] = [15, 55, 160, 210]
         hazard_name = f"{level:g} {'m' if T.z_unit == 'm' else '(relative)'} flood"
 
     elif kind == "landslide":
@@ -310,6 +348,17 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
     }
 
     summary = _summary(hazard_name, stats, zones, bottlenecks, T.metric_xy)
+    if kind == "flood":
+        if T.water_bodies:
+            kinds = sorted({wb["kind"] for wb in T.water_bodies})
+            src = f"{len(T.water_bodies)} water bod{'y' if len(T.water_bodies) == 1 else 'ies'} detected ({', '.join(kinds)})"
+        else:
+            src = "No water body detected; using the terrain's drainage lines"
+        if level == 0:
+            summary = [f"{src}. Water level 0: normal conditions, nothing flooded yet.",
+                       "Raise the water level to see the flood spread out from the water."]
+        else:
+            summary.insert(0, f"{src}. The flood spreads out from there.")
     spacing = max(4, max(h, w) // 30)
     near_danger = ndimage.binary_dilation(risk_area, iterations=max(1, spacing // 2))
     arrow_list = arrows(field, spacing, skip=(targets > 0) | ~near_danger)
@@ -317,6 +366,7 @@ def run_scenario(T: Terrain, kind: str, level: float | None = None) -> ScenarioR
     tmin = np.where(reachable, t / 60, np.nan)
     time_overlay = _time_overlay(tmin)
     payload = {"hazard": kind, "level": level, "hazard_name": hazard_name, "stats": stats,
+               "water_bodies": T.water_bodies if kind == "flood" else [],
                "summary": summary, "warnings": warnings, "zones": zones, "bottlenecks": bottlenecks,
                "arrows": arrow_list, "grid": [h, w], "units": {
                    "time": "minutes" if T.metric_xy else "approx. (pixel size unknown)",

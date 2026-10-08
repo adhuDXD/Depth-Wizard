@@ -250,7 +250,7 @@ function renderLegend() {
     html += '<b>DSM − reference</b><div class="ramp" style="background:linear-gradient(90deg,#2878dc,#f5f5f5,#d72828)"></div><div class="ends"><span>−6 m</span><span>0</span><span>+6 m</span></div>';
   } else {
     const hz = state.hazard;
-    if (hz === 'flood') html += sw('#1e6ee6', 'flooded (darker = deeper)');
+    if (hz === 'flood') html += sw('#0f37a0', 'river / lake (detected)') + sw('#1e6ee6', 'flood water (darker = deeper)');
     if (hz === 'landslide') html += sw('#dc2828', 'landslide source') + sw('#f58c1e', 'run-out path');
     if (hz === 'earthquake') html += sw('#f58c1e', 'debris zone') + sw('#787878', 'buildings');
     html += sw('#28be5a', 'safe zone') + (hz === 'flood' ? sw('#14c8d2', 'refuge building (go up)') : '');

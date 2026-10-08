@@ -94,3 +94,14 @@ def test_rejects_bad_upload(client):
     assert r.status_code == 400
     r = client.post("/api/jobs", files={"image": ("a.png", b"abc", "image/png")}, data={"params": json.dumps({"gsd": -1})})
     assert r.status_code == 422
+
+
+def test_flood_starts_from_detected_water(client, demo_job):
+    jid = demo_job["id"]
+    shares = []
+    for level in (0, 3, 8):
+        p = client.post(f"/api/jobs/{jid}/scenario", json={"hazard": "flood", "level": level}).json()
+        assert p["water_bodies"], "the demo river should be detected"
+        shares.append(p["stats"]["danger_area_share"])
+    assert shares[0] < 0.05                  # level 0: only the river itself
+    assert shares[0] < shares[1] < shares[2]  # the flood grows outward with the level
