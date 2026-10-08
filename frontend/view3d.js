@@ -50,6 +50,7 @@ export class Terrain3D {
     this.mesh = new THREE.Mesh(geo, mat);
     this.scene.add(this.mesh);
     this.applyHeights();
+    this.mesh.scale.y = this.exag;
     const span = Math.max(extentW, extentH);
     const mid = ((hi - lo) * this.zScale * this.exag) / 2;
     this.camera.near = span / 1000; this.camera.far = span * 20; this.camera.updateProjectionMatrix();
@@ -63,12 +64,13 @@ export class Terrain3D {
     if (!this.mesh) return;
     const { heights } = this.data;
     const pos = this.mesh.geometry.attributes.position;
-    for (let i = 0; i < pos.count; i++) pos.setY(i, (heights[i] - this.lo) * this.zScale * this.exag);
+    for (let i = 0; i < pos.count; i++) pos.setY(i, (heights[i] - this.lo) * this.zScale);
     pos.needsUpdate = true;
     this.mesh.geometry.computeVertexNormals();
   }
 
-  setExaggeration(x) { this.exag = x; this.applyHeights(); }
+  // vertical exaggeration is a scale on the mesh, so the 1M-vertex grid is never rebuilt
+  setExaggeration(x) { this.exag = x; if (this.mesh) this.mesh.scale.y = x; }
 
   setTexture(canvas) {
     if (!this.mesh) return;

@@ -56,6 +56,15 @@ manager = J.JobManager()
 app = FastAPI(title="DepthWizard", version=__version__)
 
 
+@app.middleware("http")
+async def no_stale_frontend(request, call_next):
+    """Always serve the current front end, so an updated copy is never hidden by the browser cache."""
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 def _job(job_id: str, ready: bool = True) -> J.Job:
     job = manager.jobs.get(job_id)
     if job is None:

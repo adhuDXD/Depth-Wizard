@@ -169,12 +169,15 @@ def meta(job: Job, model) -> dict:
     return out
 
 
-def heightmap(job: Job, max_dim: int = 512) -> tuple[bytes, int, int]:
+def heightmap(job: Job, max_dim: int = 1024) -> tuple[bytes, int, int]:
+    """DSM for the 3D mesh. Full resolution for normal scenes; when a scene is
+    larger, nearest-neighbour sampling keeps building walls vertical instead of
+    smearing them into slopes."""
     dsm = job.hm.dsm
     h, w = dsm.shape
     s = max(h, w) / max_dim
     if s > 1:
-        dsm = cv2.resize(dsm, (round(w / s), round(h / s)), interpolation=cv2.INTER_AREA)
+        dsm = cv2.resize(dsm, (round(w / s), round(h / s)), interpolation=cv2.INTER_NEAREST)
     return dsm.astype("<f4").tobytes(), dsm.shape[1], dsm.shape[0]
 
 

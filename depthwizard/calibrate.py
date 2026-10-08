@@ -76,10 +76,36 @@ def detect_shadows(rgb: np.ndarray, water: np.ndarray | None = None) -> np.ndarr
     return _remove_small(m, 4)
 
 
+def _local_std(gray: np.ndarray, size: int = 5) -> np.ndarray:
+    return np.sqrt(np.maximum(ndimage.uniform_filter(gray ** 2, size) - ndimage.uniform_filter(gray, size) ** 2, 0))
+
+
 def detect_vegetation(rgb: np.ndarray) -> np.ndarray:
+    """Green AND textured: tree canopy is leafy, a green-painted roof is smooth."""
     f = rgb.astype(np.float32)
     exg = (2 * f[..., 1] - f[..., 0] - f[..., 2]) / (f.sum(axis=2) + 1)
-    return exg > 0.06
+    return (exg > 0.06) & (_local_std(f.mean(axis=2)) > 5)
+
+
+def roof_segments(rgb: np.ndarray, ndsm_rel: np.ndarray, thr: float, shadow: np.ndarray,
+                  gsd: float | None) -> np.ndarray:
+    """Whole roofs: uniform-colour patches bounded by edges whose median relative
+    height is raised. Snapping to these patches recovers roof parts the depth
+    model under-estimates, and gives buildings clean, straight outlines."""
+    lab_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    grad = sum(np.hypot(cv2.Sobel(lab_img[..., c], cv2.CV_32F, 1, 0), cv2.Sobel(lab_img[..., c], cv2.CV_32F, 0, 1))
+               for c in range(3))
+    uniform = (grad < 60) & (_local_std(rgb.astype(np.float32).mean(axis=2)) < 6) & ~shadow
+    uniform = cv2.morphologyEx(uniform.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(uniform, connectivity=4)
+    if n <= 1:
+        return np.zeros(rgb.shape[:2], bool)
+    area = stats[:, cv2.CC_STAT_AREA]
+    px_m2 = gsd ** 2 if gsd else 0.25
+    med = ndimage.median(ndsm_rel, lab, np.arange(n))
+    ok = (area * px_m2 >= 20) & (area * px_m2 <= 2000) & (med > 0.5 * thr)
+    ok[0] = False
+    return cv2.dilate(ok[lab].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
 
 
 def detect_water(rgb: np.ndarray, gsd: float | None, exclude: np.ndarray | None = None) -> np.ndarray:
@@ -335,8 +361,9 @@ def calibrate(rgb: np.ndarray, rel: np.ndarray, unc_rel: np.ndarray, dem: np.nda
     elevated = (ndsm_rel > thr) & ~water
     elevated = cv2.morphologyEx(elevated.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
     min_bldg_px = int(20 / gsd ** 2) if gsd else 15
-    tree = elevated & veg
-    building = _remove_small(elevated & ~veg, max(min_bldg_px, 6))
+    roofs = roof_segments(rgb, ndsm_rel, thr, shadow, gsd) & ~water
+    tree = elevated & veg & ~roofs
+    building = _remove_small((elevated & ~veg) | roofs, max(min_bldg_px, 6))
     n_lab, building_lab = cv2.connectedComponents(building.astype(np.uint8), connectivity=8)
 
     # ---- terrain

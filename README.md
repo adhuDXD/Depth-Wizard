@@ -91,7 +91,7 @@ DEM ─► + datum offset ─► terrain (DTM)│◄── GCPs (fix DEM bias, a
 | Surface RMSE | Whole scene | Buildings & trees |
 |---|---|---|
 | 30 m DEM only (datum-corrected) | 6.09 m | 11.54 m |
-| DepthWizard, Depth Anything V2 + shadows | **4.14 m** | **7.01 m** |
+| DepthWizard, Depth Anything V2 + shadows | **3.71 m** | **6.03 m** |
 | DepthWizard, non-AI fallback | 6.32 m | 11.45 m |
 
 Shadow-measured building heights reach 3.1 m RMSE (r = 0.91) against the truth with the slope correction, and 5.5 m (r = 0.78) without it. On this synthetic render, the AI's within-building values do **not** track height (ρ ≈ 0), so the app leans on shadows and says so. Real Indian validation still needs ICESat-2 / GEDI / field data; see `docs/IMPROVEMENT_PLAN.md`.

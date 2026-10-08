@@ -28,7 +28,7 @@ async function init() {
     const h = await (await api('/api/health')).json();
     state.hazards = h.hazards;
     const b = $('modelBadge');
-    b.textContent = h.model_is_ai ? `AI: ${h.model}` : 'No AI model installed: demo heuristic';
+    b.textContent = `v${h.version} · ` + (h.model_is_ai ? `AI: ${h.model}` : 'No AI model installed: demo heuristic');
     b.classList.toggle('fallback', !h.model_is_ai);
     configureSlider();
   } catch (e) {
