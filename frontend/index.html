@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DepthWizard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M2 26 L11 12 L16 19 L21 9 L30 26 Z' fill='%232f7d5b'/></svg>">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">{"imports": {"three": "./vendor/three.module.min.js"}}</script>
+</head>
+<body data-mode="guided">
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M2 26 L11 12 L16 19 L21 9 L30 26 Z"/></svg>
+      <span>DepthWizard</span>
+    </div>
+    <div class="model-badge" id="modelBadge">Loading model…</div>
+    <div class="spacer"></div>
+    <div class="seg" role="tablist" aria-label="Interface mode">
+      <button data-set-mode="guided" class="active">Guided</button>
+      <button data-set-mode="expert">Expert</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel" id="panel">
+      <!-- STEP 1 -->
+      <section class="card" id="stepLoad">
+        <h2><span class="num">1</span> Load a satellite image</h2>
+        <label class="drop" id="drop">
+          <input type="file" id="imageFile" accept=".png,.jpg,.jpeg,.tif,.tiff">
+          <strong id="dropText">Drop PNG / JPG / GeoTIFF here</strong>
+          <span class="muted">or click to choose</span>
+        </label>
+        <label class="field">Elevation model (DEM GeoTIFF, optional)
+          <input type="file" id="demFile" accept=".tif,.tiff">
+        </label>
+        <details class="more">
+          <summary>Image details (improve accuracy)</summary>
+          <div class="grid2">
+            <label class="field">Pixel size (m)<input type="number" id="gsd" step="0.01" min="0" placeholder="e.g. 0.5"></label>
+            <label class="field">Typical tallest building (m)<input type="number" id="prior" step="1" min="0" placeholder="optional"></label>
+            <label class="field">Sun elevation (°)<input type="number" id="sunEl" step="0.1" min="0" max="90" placeholder="from metadata"></label>
+            <label class="field">Sun azimuth (°)<input type="number" id="sunAz" step="0.1" min="0" max="360" placeholder="from metadata"></label>
+            <label class="field">Acquired (UTC)<input type="datetime-local" id="acquired"></label>
+            <label class="field">DEM datum offset (m)<input type="number" id="geoid" step="0.1" value="0"></label>
+          </div>
+          <p class="hint">The sun angles and pixel size let DepthWizard measure building heights from shadows. GeoTIFFs usually carry them already.</p>
+        </details>
+        <div class="row">
+          <button class="primary" id="runBtn" disabled>Build 3D model</button>
+          <button class="ghost" id="demoBtn">Try demo town</button>
+        </div>
+        <div class="progress hidden" id="progress"><div class="bar"><i id="progressBar"></i></div><span id="progressMsg"></span></div>
+        <p class="error hidden" id="loadError"></p>
+      </section>
+
+      <!-- STEP 2 -->
+      <section class="card hidden" id="stepModel">
+        <h2><span class="num">2</span> Height model</h2>
+        <div class="mode-pill" id="modePill"></div>
+        <div class="tiles" id="modelTiles"></div>
+        <div class="confbar" id="confBar" title="Share of the image by confidence"></div>
+        <ul class="notes" id="modelNotes"></ul>
+      </section>
+
+      <!-- STEP 3 -->
+      <section class="card hidden" id="stepHazard">
+        <h2><span class="num">3</span> Plan escape routes</h2>
+        <div class="seg wide" id="hazardSeg">
+          <button data-hazard="flood" class="active">Flood</button>
+          <button data-hazard="landslide">Landslide</button>
+          <button data-hazard="earthquake">Earthquake</button>
+        </div>
+        <label class="field slider"><span id="levelLabel">Water rise</span>
+          <input type="range" id="level" min="0.5" max="15" step="0.5" value="3">
+          <output id="levelOut">3 m</output>
+        </label>
+        <div class="summary" id="summary" aria-live="polite"></div>
+        <div class="tiles" id="hazardTiles"></div>
+        <p class="hint">Tap anywhere on the map to get the walking route from that spot.</p>
+        <div class="route hidden" id="routeBox"></div>
+        <details class="more" id="zonesBox"><summary>Safe zones</summary><table class="zones" id="zonesTable"></table></details>
+        <div class="row wrap">
+          <button class="primary" id="printBtn">Print evacuation plan</button>
+          <a class="btn ghost" id="geojsonBtn" download>GeoJSON</a>
+          <a class="btn ghost" id="kmlBtn" download>KML (phones)</a>
+        </div>
+        <ul class="notes warn" id="hazardWarnings"></ul>
+      </section>
+
+      <!-- EXPERT -->
+      <section class="card expert-only hidden" id="stepExpert">
+        <h2>Expert tools</h2>
+        <div class="field">Map layer
+          <div class="seg wrap" id="layerSeg">
+            <button data-layer="image" class="active">Image</button>
+            <button data-layer="height">Surface</button>
+            <button data-layer="buildings">Heights</button>
+            <button data-layer="confidence">Confidence</button>
+            <button data-layer="drainage">Drainage</button>
+            <button data-layer="error" id="errorLayerBtn" class="hidden">Error</button>
+            <button data-layer="time">Time to safety</button>
+          </div>
+        </div>
+        <div class="row wrap">
+          <button class="ghost" id="profileBtn">Elevation profile</button>
+          <button class="ghost" id="inspectBtn">Inspect point</button>
+        </div>
+        <canvas id="profileChart" class="hidden" height="160"></canvas>
+        <div id="pointInfo" class="pointinfo hidden"></div>
+        <h3>Validation</h3>
+        <div id="validation"><p class="muted">Upload a reference DSM (LiDAR / stereo GeoTIFF) to measure error.</p></div>
+        <label class="field">Reference DSM<input type="file" id="refFile" accept=".tif,.tiff"></label>
+        <h3>Downloads</h3>
+        <div class="row wrap">
+          <a class="btn ghost" id="dsmBtn" download>DSM GeoTIFF</a>
+          <a class="btn ghost" id="ndsmBtn" download>Heights GeoTIFF</a>
+          <a class="btn ghost" id="uncBtn" download>Uncertainty GeoTIFF</a>
+        </div>
+        <details class="more"><summary>Measured anchors</summary><div id="anchors" class="anchors"></div></details>
+      </section>
+    </aside>
+
+    <section class="stage">
+      <div class="stage-tabs seg">
+        <button data-view="map" class="active">Map</button>
+        <button data-view="3d">3D</button>
+      </div>
+      <div class="view" id="mapView">
+        <canvas id="mapCanvas"></canvas>
+        <div class="empty" id="empty">
+          <svg viewBox="0 0 120 60" aria-hidden="true"><path d="M5 55 L35 18 L52 38 L70 10 L115 55 Z"/></svg>
+          <p><strong>From one satellite image to an evacuation plan.</strong></p>
+          <p class="muted">Load an image, or try the demo town.</p>
+        </div>
+        <div class="legend hidden" id="legend"></div>
+        <div class="zoom">
+          <button id="zoomIn" aria-label="Zoom in">+</button>
+          <button id="zoomOut" aria-label="Zoom out">−</button>
+          <button id="zoomFit" aria-label="Fit">⤢</button>
+        </div>
+        <div class="tooltip hidden" id="tooltip"></div>
+      </div>
+      <div class="view hidden" id="view3d">
+        <div id="three"></div>
+        <label class="exag">Height ×<input type="range" id="exag" min="1" max="6" step="0.5" value="1"><output id="exagOut">1</output></label>
+        <p class="hint3d">Drag to rotate · right-drag to pan · scroll to zoom</p>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

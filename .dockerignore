@@ -1,0 +1,4 @@
+data/
+models/*.onnx
+**/__pycache__
+.git
