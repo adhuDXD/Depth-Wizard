@@ -2,6 +2,8 @@
 
 **One satellite image → a metric 3D surface model → a disaster evacuation plan.**
 
+Smart India Hackathon 2026 · Problem statement **SIH26175** · ISRO
+
 DepthWizard is a web app. Load a satellite image (PNG, JPG or GeoTIFF) and it:
 
 1. estimates the height of every building, tree and terrain feature (Depth Anything V2 + shadow geometry + DEM),
@@ -14,6 +16,10 @@ It runs on one ordinary office PC (CPU is enough). Everyone else on the network 
 ---
 
 ## Quick start
+
+**Windows, easiest way:** download the ZIP (GitHub → Code → Download ZIP), extract it, and double-click **`run_local.bat`**. The first run installs everything (about 5 minutes); after that it starts in seconds and opens http://localhost:8000. Linux/macOS: `./run_local.sh`.
+
+**Manual:**
 
 ```bash
 pip install -r requirements.txt
