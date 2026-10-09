@@ -25,6 +25,7 @@ from .hazards import COVER, ScenarioResult, Terrain, build_terrain, cover_rgb, r
 from . import config
 from .dem import Dem, get_dem
 from .osm import get_buildings
+from .inputcheck import check_image
 from .scene import Scene, load_dem, load_image
 from .sun import sun_position
 from .validate import compare
@@ -41,6 +42,7 @@ class Job:
     progress: float = 0.0
     message: str = "Waiting"
     error: str | None = None
+    rejected: bool = False               # input check: not an image of land (user may force it)
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
     scene: Scene | None = None
     hm: HeightModel | None = None
@@ -115,6 +117,19 @@ class JobManager:
             notes = []
 
             notes += scene.notes or []
+            # a georeferenced raster is a map by construction; anything else is checked first, so
+            # a selfie or a document fails in a second with a reason instead of producing nonsense
+            if not scene.georeferenced:
+                report(0.03, "Checking that this is an image of land")
+                if p.get("force"):
+                    notes.append("Input check skipped at the user's request (\"Process anyway\").")
+                else:
+                    chk = check_image(scene.rgb, self.model)
+                    if not chk.ok:
+                        job.rejected = True
+                        raise ValueError(chk.message)
+                    if chk.warning:
+                        notes.append(chk.warning)
             el, az = p.get("sun_elevation"), p.get("sun_azimuth")
             acquired = p.get("acquired") or scene.acquired
             if el is not None and az is not None:
@@ -236,7 +251,7 @@ def read_gcps_csv(path: str, scene: Scene) -> list[dict]:
 
 def meta(job: Job, model) -> dict:
     out = {"id": job.id, "name": job.name, "status": job.status, "progress": job.progress,
-           "message": job.message, "error": job.error, "created": job.created,
+           "message": job.message, "error": job.error, "rejected": job.rejected, "created": job.created,
            "model": {"name": model.name, "is_ai": model.is_ai}}
     if job.status != "done":
         return out

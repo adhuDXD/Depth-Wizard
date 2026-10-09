@@ -80,7 +80,10 @@ drop.addEventListener('drop', (e) => {
 
 function numberOrNull(id) { const v = $(id).value; return v === '' ? null : Number(v); }
 
-$('runBtn').addEventListener('click', async () => {
+$('runBtn').addEventListener('click', () => submitUpload(false));
+
+// force = true skips the "is this an image of land?" check (the user's "Process anyway")
+function submitUpload(force) {
   const fd = new FormData();
   fd.append('image', imageFile.files[0]);
   if ($('demFile').files.length) fd.append('dem', $('demFile').files[0]);
@@ -92,9 +95,10 @@ $('runBtn').addEventListener('click', async () => {
     acquired: acquired ? `${acquired}:00Z` : null, geoid_offset_m: numberOrNull('geoid'),
     building_height_prior_m: numberOrNull('prior'), off_nadir: numberOrNull('offNadir'),
     view_azimuth: numberOrNull('viewAz'), dem_kind: $('demKind').value || null, osm_fetch: $('osmFetch').checked,
+    force,
   }));
   startJob(() => api('/api/jobs', { method: 'POST', body: fd }));
-});
+}
 $('demoBtn').addEventListener('click', () => startJob(() => api('/api/demo', { method: 'POST' })));
 $('namchiBtn').addEventListener('click', () => startJob(() => api('/api/demo?scene=namchi', { method: 'POST' })));
 
@@ -110,14 +114,22 @@ async function startJob(request) {
       await new Promise((r) => setTimeout(r, 600));
       meta = await (await api(`/api/jobs/${meta.id}`)).json();
     }
-    if (meta.status === 'error') throw new Error(meta.error);
+    if (meta.status === 'error') throw Object.assign(new Error(meta.error), { rejected: meta.rejected });
     $('progressBar').style.width = '100%';
     $('progressMsg').textContent = 'Done';
     await onReady(meta);
     refreshHistory();
   } catch (e) {
-    $('loadError').textContent = `Could not process: ${e.message}`;
-    $('loadError').classList.remove('hidden');
+    const box = $('loadError');
+    box.classList.remove('hidden');
+    $('progress').classList.add('hidden');
+    if (e.rejected) {
+      box.innerHTML = `<b>Invalid input: not an image of land.</b> ${escapeHtml(e.message)}
+        <br><button class="ghost" id="forceBtn">Process anyway</button>`;
+      $('forceBtn').addEventListener('click', () => submitUpload(true));
+    } else {
+      box.textContent = `Could not process: ${e.message}`;
+    }
   } finally {
     $('runBtn').disabled = !imageFile.files.length; $('demoBtn').disabled = false;
   }

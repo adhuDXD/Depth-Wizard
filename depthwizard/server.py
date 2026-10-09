@@ -45,6 +45,7 @@ class JobParams(BaseModel):
     view_azimuth: float | None = Field(default=None, ge=0, le=360, description="ground -> satellite")
     dem_kind: str | None = Field(default=None, pattern="^(surface|terrain)$")
     osm_fetch: bool = True
+    force: bool = Field(default=False, description="skip the 'is this an image of land?' check")
 
 
 class ScenarioReq(BaseModel):

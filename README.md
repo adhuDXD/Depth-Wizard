@@ -111,6 +111,7 @@ LiDAR table remains its reference.
 
 ## Using it
 
+* **Input check.** Before any processing, a PNG/JPG is checked to be a top-down image of land (about 0.5 s). Selfies, pets, street or room photos, landscapes taken from the ground, documents, logos and drawings are stopped with **"Invalid input: not an image of land"** and the reason. **Process anyway** overrides it. Tested on 72 satellite scenes from 18 Maxar events (none rejected) and 93 other pictures (73 rejected, 8 more warned). Georeferenced GeoTIFFs are maps already and skip the check. Code: `depthwizard/inputcheck.py`.
 * **Guided mode** (default), in three steps: load image → read the height-model card → pick a hazard and move the slider. Tap the map for the walking route from any spot. **Print evacuation plan** opens a one-page report.
 * **Expert mode** adds:
   * layers: surface, building heights, confidence, **land cover** (buildings vs hillside), **ground slope**, drainage, error, time-to-safety
